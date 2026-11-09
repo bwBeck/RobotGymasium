@@ -75,7 +75,8 @@ def root():
         pass  # the app already destroyed it
 
 
-def test_lever_drives_the_robot_and_the_window_shows_the_images(root):
+@pytest.fixture
+def app_and_robot(root):
     with FakeRobotServer() as fake:
         env = RoboGym(**fake.env_kwargs(), render_mode="rgb_array",
                       reset_settle_time=0.05, calibrate_gyro_on_reset=False)
@@ -85,29 +86,68 @@ def test_lever_drives_the_robot_and_the_window_shows_the_images(root):
             # A parked fake robot renders identical frames, which the window doesn't
             # repaint - so expect one frame now and fresh ones once it moves.
             assert _pump(root, until=lambda: app.steps_shown >= 2 and app.camera_frames >= 1), app.status.get()
-            assert app._camera_photo.width() == 640  # 320x240 stream, shown 2x
-            assert app._obs_photo.width() == 2 * env.image_shape[1]
-            assert app.status.get() == "connected"
-
-            start, frames = fake.robot.x, app.camera_frames
-            app.lever.set(0.0, 1.0)  # lever fully forward
-            _pump(root, seconds=1.0)
-            assert fake.robot.cmd == [204, 204]  # 0.8 * 255
-            assert fake.robot.x > start + 0.05
-            assert app.camera_frames >= frames + 5  # the live feed follows the motion
-            assert "steps/s" in app.readout.get()
-
-            app.lever._release()  # let go: springs back, the robot stops
-            assert _pump(root, until=lambda: fake.robot.cmd == [0, 0])
-
-            app.hold.set(True)
-            app.lever.set(-1.0, 0.0)  # full left...
-            app.lever._release()  # ...and let go: held, keeps turning left
-            _pump(root, seconds=0.6)
-            assert fake.robot.cmd[0] < 0 < fake.robot.cmd[1]
-            app.stop_robot()
-            assert _pump(root, until=lambda: fake.robot.cmd == [0, 0])
+            yield app, fake.robot
         finally:
             app.quit()
         assert not app.runner.is_alive()
         assert fake.robot.received[-1] == '"N":100'  # env closed: the bridge saw the disconnect
+
+
+def _label(lever) -> str:
+    return lever.itemcget(lever.value_text, "text")
+
+
+def test_joystick_drives_the_robot_and_the_window_shows_the_images(root, app_and_robot):
+    app, robot = app_and_robot
+    assert app._camera_photo.width() == 640  # 320x240 stream, shown 2x
+    assert app._obs_photo.width() == 2 * app.env.image_shape[1]
+    assert app.status.get() == "connected"
+
+    start, frames = robot.x, app.camera_frames
+    app.joystick.set(0.0, 1.0)  # joystick fully forward
+    _pump(root, seconds=1.0)
+    assert robot.cmd == [204, 204]  # 0.8 * 255
+    assert robot.x > start + 0.05
+    assert app.camera_frames >= frames + 5  # the live feed follows the motion
+    assert "steps/s" in app.readout.get()
+    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.80", "+0.80")  # they follow
+
+    app.joystick.release()  # let go: springs back, the robot stops
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+
+    app.hold.set(True)
+    app.joystick.set(-1.0, 0.0)  # full left...
+    app.joystick.release()  # ...and let go: held, keeps turning left
+    _pump(root, seconds=0.6)
+    assert robot.cmd[0] < 0 < robot.cmd[1]
+    app.stop_robot()
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+
+
+def test_side_levers_drive_one_track_each(root, app_and_robot):
+    app, robot = app_and_robot
+    app.left_lever.set(0.5)  # left track only
+    assert _pump(root, until=lambda: robot.cmd == [102, 0])  # 0.5 * 0.8 * 255
+    assert _label(app.left_lever) == "+0.40" and _label(app.right_lever) == "+0.00"
+    app.left_lever.release()  # let go: only that track stops
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+
+    app.right_lever.set(0.5)
+    assert _pump(root, until=lambda: robot.cmd == [0, 102])
+    app.right_lever.release()
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+
+    app.hold.set(True)  # tank-style: set one lever, then the other; both stay
+    app.left_lever.set(0.5)
+    app.left_lever.release()
+    app.right_lever.set(-0.5)
+    app.right_lever.release()
+    assert _pump(root, until=lambda: robot.cmd == [102, -102])
+    assert app.joystick.position == pytest.approx((0.5, 0.0))  # joystick shows it: spin right
+
+    app.joystick.set(0.0, 1.0)  # the joystick takes over both tracks
+    assert _pump(root, until=lambda: robot.cmd == [204, 204])
+    app.stop_robot()
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+    assert app.joystick.position == (0.0, 0.0)
+    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")

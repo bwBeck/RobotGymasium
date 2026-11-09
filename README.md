@@ -139,10 +139,16 @@ keep it still for ~2 seconds after switching it on.
 
 * **Live camera feed** at the camera's full rate (~20 fps), plus the **image the agent
   gets** in its observation, and every value of the latest observation and `info`.
-* **The lever**: drag it up/down for forward/reverse and left/right to turn. One drag
-  controls both tracks, and the bars beside it show the `[left, right]` action being sent.
-  **Let go and it springs back to the centre, which stops the robot.** Tick *Hold lever*
-  to make it stay where you leave it. *Max speed* scales the lever's range.
+* **Three levers** set the same `[left, right]` action:
+  * **the joystick**: up/down for forward/reverse, left/right to turn, so one drag
+    controls both tracks;
+  * **the left and right levers**: one track each. They also show what each track is
+    getting from the joystick, and the joystick moves to match them.
+
+  **Let go of a lever and it springs back, which stops the robot.** The joystick stops
+  both tracks; a side lever stops only its own track. Tick *Hold levers* to make them stay
+  where you leave them. For tank-style driving, set the left lever, then the right one.
+  *Max speed* scales all three; the side levers' labels show the speed actually sent.
 * **STOP** or **Space** always stops. *Reset odometry* calls `env.reset()`, and **Esc**
   or closing the window stops the robot and disconnects.
 

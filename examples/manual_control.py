@@ -3,14 +3,18 @@
     python examples/manual_control.py           # the real robot (PC on its "ELEGOO-xxxx" WiFi)
     python examples/manual_control.py --fake    # simulated robot, no hardware
 
-Drag the lever: up/down = forward/reverse, left/right = turn. Let go and it springs back
-to the centre, which stops the robot; tick "Hold lever" to make it stay where you leave
-it. The STOP button or Space always stops; Esc, closing the window or Ctrl+C in the
-terminal stops the robot and quits.
+Three levers set the same two track speeds:
+  * the joystick: up/down = forward/reverse, left/right = turn (both tracks at once);
+  * the "left" and "right" levers: one track each. They also show what each track is
+    getting from the joystick, and the joystick follows them.
+Let go of a lever and it springs back, which stops the robot - the joystick stops both
+tracks, a side lever its own track. Tick "Hold levers" to make them stay where you leave
+them, e.g. to drive tank-style with the two side levers. The STOP button or Space always
+stops; Esc, closing the window or Ctrl+C in the terminal stops the robot and quits.
 
 The window shows the live camera feed, the image the agent receives in its observation,
 and the values of the latest observation. The env runs in a background thread that steps
-as fast as the robot answers (~5 Hz) with whatever the lever says, so the window never
+as fast as the robot answers (~5 Hz) with whatever the levers say, so the window never
 waits for the robot.
 
 Needs tkinter, which comes with Python (Debian/Ubuntu: sudo apt install python3-tk).
@@ -105,16 +109,16 @@ class Shared:
 
     def __init__(self, max_speed: float):
         self._lock = threading.Lock()
-        self._stick = (0.0, 0.0)
+        self._command = (0.0, 0.0)  # [left, right] from the levers, -1..1, before max speed
         self._max_speed = max_speed
         self._ui_alive = time.monotonic()
         self._reset_requested = False
         self._result: StepResult | None = None
         self._status = ("starting...", False)
 
-    def set_stick(self, x: float, y: float) -> None:
+    def set_command(self, left: float, right: float) -> None:
         with self._lock:
-            self._stick = (x, y)
+            self._command = (left, right)
 
     def set_max_speed(self, speed: float) -> None:
         with self._lock:
@@ -126,12 +130,12 @@ class Shared:
             self._ui_alive = time.monotonic()
 
     def action(self) -> np.ndarray:
-        """The lever as an env action; zero if the window has stopped refreshing."""
+        """The levers as an env action; zero if the window has stopped refreshing."""
         with self._lock:
-            (x, y), speed, alive = self._stick, self._max_speed, self._ui_alive
+            command, speed, alive = self._command, self._max_speed, self._ui_alive
         if time.monotonic() - alive > UI_STALE_S:
             return np.zeros(2, dtype=np.float32)
-        return np.array(arcade_mix(x, y), dtype=np.float32) * speed
+        return np.array(command, dtype=np.float32) * speed
 
     def request_reset(self) -> None:
         with self._lock:
@@ -214,18 +218,18 @@ class EnvRunner(threading.Thread):
         self.shared.publish(StepResult(obs, info, action, self._count, rate))
 
 
-class Lever(tk.Canvas):
-    """Joystick-style lever. Calls ``on_move(x, y)``: x = right, y = forward, each -1..1.
+LEVER_IDLE, LEVER_ACTIVE = "#2f6fd6", "#5b93f2"
 
-    Springs back to the centre when released, unless ``hold`` is set.
-    """
 
-    IDLE, ACTIVE = "#2f6fd6", "#5b93f2"
+class Joystick(tk.Canvas):
+    """Joystick-style lever: ``on_move(x, y)`` (x = right, y = forward, each -1..1) while
+    dragged, ``on_release()`` when let go. The app decides what a release does."""
 
-    def __init__(self, master: tk.Misc, size: int, on_move, hold: tk.BooleanVar, bg: str | None = None):
+    def __init__(self, master: tk.Misc, size: int, on_move, on_release, bg: str | None = None):
         super().__init__(master, width=size, height=size, highlightthickness=0, bg=bg)
         self.on_move = on_move
-        self.hold = hold
+        self.on_release = on_release
+        self.position = (0.0, 0.0)  # where the knob is drawn
         self.k = 20  # knob radius
         self.c = size / 2
         self.r = size / 2 - self.k - 19  # travel of the knob's centre; keeps clear of the labels
@@ -236,18 +240,32 @@ class Lever(tk.Canvas):
         for text, x, y in (("FWD", c, 9), ("REV", c, size - 9), ("L", 9, c), ("R", size - 9, c)):
             self.create_text(x, y, text=text, fill="#5f6b7a", font=("TkDefaultFont", 9, "bold"))
         self.stem = self.create_line(c, c, c, c, fill="#7b8794", width=7, capstyle="round")
-        self.knob = self.create_oval(0, 0, 0, 0, fill=self.IDLE, outline="#1d4f9e", width=2)
-        self._draw(0.0, 0.0)
+        self.knob = self.create_oval(0, 0, 0, 0, fill=LEVER_IDLE, outline="#1d4f9e", width=2)
+        self.show(0.0, 0.0)
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._drag)
-        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<ButtonRelease-1>", lambda _e: self.release())
 
     def set(self, x: float, y: float) -> None:
-        self._draw(x, y)
+        """As if dragged to (x, y)."""
+        self.show(x, y)
         self.on_move(x, y)
 
+    def release(self) -> None:
+        """As if let go."""
+        self.itemconfigure(self.knob, fill=LEVER_IDLE)
+        self.on_release()
+
+    def show(self, x: float, y: float) -> None:
+        """Draws the knob at (x, y) without reporting a move."""
+        c, r, k = self.c, self.r, self.k
+        px, py = c + x * r, c - y * r
+        self.coords(self.stem, c, c, px, py)
+        self.coords(self.knob, px - k, py - k, px + k, py + k)
+        self.position = (x, y)
+
     def _press(self, event) -> None:
-        self.itemconfigure(self.knob, fill=self.ACTIVE)
+        self.itemconfigure(self.knob, fill=LEVER_ACTIVE)
         self._drag(event)
 
     def _drag(self, event) -> None:
@@ -257,45 +275,60 @@ class Lever(tk.Canvas):
             dx, dy = dx * self.r / dist, dy * self.r / dist
         self.set(dx / self.r, -dy / self.r)
 
-    def _release(self, _event=None) -> None:
-        self.itemconfigure(self.knob, fill=self.IDLE)
-        if not self.hold.get():
-            self.set(0.0, 0.0)
 
-    def _draw(self, x: float, y: float) -> None:
-        c, r, k = self.c, self.r, self.k
-        px, py = c + x * r, c - y * r
-        self.coords(self.stem, c, c, px, py)
-        self.coords(self.knob, px - k, py - k, px + k, py + k)
+class TrackLever(tk.Canvas):
+    """Vertical lever for one track, up = forward: ``on_move(value)`` (-1..1) while
+    dragged, ``on_release()`` when let go. It also displays the track's command, whichever
+    lever set it, labelled with the speed actually sent."""
 
+    SNAP = 0.05  # this close to the middle counts as exactly 0: that track stopped
 
-class TrackGauges(tk.Canvas):
-    """Two vertical bars: the left / right track command being sent (-1..1)."""
-
-    def __init__(self, master: tk.Misc, height: int, bg: str | None = None):
-        super().__init__(master, width=100, height=height, highlightthickness=0, bg=bg)
-        self.top, self.bottom = 24, height - 24
+    def __init__(self, master: tk.Misc, name: str, height: int, on_move, on_release,
+                 bg: str | None = None):
+        super().__init__(master, width=58, height=height, highlightthickness=0, bg=bg)
+        self.on_move = on_move
+        self.on_release = on_release
+        self.cx = 29
+        self.top, self.bottom = 28, height - 28
         self.mid = (self.top + self.bottom) / 2
         self.half = (self.bottom - self.top) / 2
-        self.columns = []
-        for i, name in enumerate(("left", "right")):
-            x0 = 12 + i * 46
-            x1 = x0 + 30
-            self.create_rectangle(x0, self.top, x1, self.bottom, fill="#eef1f5", outline="#9aa5b1")
-            bar = self.create_rectangle(x0 + 1, self.mid, x1 - 1, self.mid, fill="#3aa757", outline="")
-            self.create_line(x0 - 4, self.mid, x1 + 4, self.mid, fill="#5f6b7a")
-            self.create_text((x0 + x1) / 2, self.top - 12, text=name, fill="#3c4650",
-                             font=("TkDefaultFont", 9, "bold"))
-            value = self.create_text((x0 + x1) / 2, self.bottom + 12, text="+0.00", fill="#3c4650",
-                                     font=("TkFixedFont", 9))
-            self.columns.append((x0, x1, bar, value))
+        cx = self.cx
+        self.create_text(cx, 11, text=name, fill="#3c4650", font=("TkDefaultFont", 9, "bold"))
+        self.create_rectangle(cx - 7, self.top, cx + 7, self.bottom, fill="#eef1f5", outline="#9aa5b1")
+        self.bar = self.create_rectangle(cx - 6, self.mid, cx + 6, self.mid, fill="#3aa757", outline="")
+        self.create_line(cx - 13, self.mid, cx + 13, self.mid, fill="#5f6b7a")
+        self.handle = self.create_rectangle(0, 0, 0, 0, fill=LEVER_IDLE, outline="#1d4f9e", width=2)
+        self.value_text = self.create_text(cx, height - 11, text="+0.00", fill="#3c4650",
+                                           font=("TkFixedFont", 9))
+        self.show(0.0, 0.0)
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", lambda _e: self.release())
 
-    def set(self, left: float, right: float) -> None:
-        for (x0, x1, bar, value), v in zip(self.columns, (left, right)):
-            y = self.mid - v * self.half
-            self.coords(bar, x0 + 1, min(y, self.mid), x1 - 1, max(y, self.mid))
-            self.itemconfigure(bar, fill="#3aa757" if v >= 0 else "#e8833a")
-            self.itemconfigure(value, text=f"{v:+.2f}")
+    def set(self, value: float) -> None:
+        """As if dragged to ``value``."""
+        self.on_move(value)
+
+    def release(self) -> None:
+        """As if let go."""
+        self.itemconfigure(self.handle, fill=LEVER_IDLE)
+        self.on_release()
+
+    def show(self, value: float, sent: float) -> None:
+        """Draws the lever at ``value``, labelled with the speed ``sent`` to the robot."""
+        cx, y = self.cx, self.mid - value * self.half
+        self.coords(self.bar, cx - 6, min(y, self.mid), cx + 6, max(y, self.mid))
+        self.itemconfigure(self.bar, fill="#3aa757" if value >= 0 else "#e8833a")
+        self.coords(self.handle, cx - 17, y - 7, cx + 17, y + 7)
+        self.itemconfigure(self.value_text, text=f"{sent:+.2f}")
+
+    def _press(self, event) -> None:
+        self.itemconfigure(self.handle, fill=LEVER_ACTIVE)
+        self._drag(event)
+
+    def _drag(self, event) -> None:
+        value = max(-1.0, min(1.0, (self.mid - event.y) / self.half))
+        self.set(0.0 if abs(value) < self.SNAP else value)
 
 
 class ManualControlApp:
@@ -314,6 +347,8 @@ class ManualControlApp:
         self._camera_t: float | None = None
         self._camera_photo: tk.PhotoImage | None = None
         self._obs_photo: tk.PhotoImage | None = None
+        self._command = (0.0, 0.0)  # [left, right], -1..1: what all three levers show
+        self._max_speed = max_speed
         self._build(max_speed)
 
     def start(self) -> None:
@@ -333,17 +368,18 @@ class ManualControlApp:
             self.quit()
 
     def stop_robot(self) -> None:
-        self.lever.set(0.0, 0.0)
+        self.joystick.show(0.0, 0.0)
+        self._set_command(0.0, 0.0)
 
     def reset_odometry(self) -> None:
-        self.lever.set(0.0, 0.0)
+        self.stop_robot()
         self.shared.request_reset()
 
     def quit(self) -> None:
         if self.closing:
             return
         self.closing = True  # stops _tick, so nothing renders while the env closes
-        self.shared.set_stick(0.0, 0.0)
+        self.shared.set_command(0.0, 0.0)
         self.status.set("stopping the robot...")
         self.root.update_idletasks()
         self.runner.stop_event.set()
@@ -393,10 +429,17 @@ class ManualControlApp:
         self._obs_item = self.obs_canvas.create_image(ow * OBS_ZOOM // 2, oh * OBS_ZOOM // 2)
 
         self.hold = tk.BooleanVar(value=False)
-        self.lever = Lever(right, size=240, on_move=self.shared.set_stick, hold=self.hold, bg=bg)
-        self.lever.grid(row=2, column=0)
-        self.gauges = TrackGauges(right, height=240, bg=bg)
-        self.gauges.grid(row=2, column=1, padx=(6, 0))
+        self.joystick = Joystick(right, size=240, on_move=self._on_joystick,
+                                 on_release=self._on_joystick_release, bg=bg)
+        self.joystick.grid(row=2, column=0)
+        tracks = ttk.Frame(right)
+        tracks.grid(row=2, column=1, padx=(4, 0))
+        self.left_lever = TrackLever(tracks, "left", 240, lambda v: self._on_track(0, v),
+                                     lambda: self._on_track_release(0), bg=bg)
+        self.right_lever = TrackLever(tracks, "right", 240, lambda v: self._on_track(1, v),
+                                      lambda: self._on_track_release(1), bg=bg)
+        self.left_lever.pack(side="left")
+        self.right_lever.pack(side="left")
 
         speed = ttk.Frame(right)
         speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -414,12 +457,14 @@ class ManualControlApp:
         tk.Button(buttons, text="STOP", command=self.stop_robot, bg="#d93025", fg="white",
                   activebackground="#b3261e", activeforeground="white", font=bold, width=7,
                   takefocus=False).pack(side="left")
-        ttk.Checkbutton(buttons, text="Hold lever", variable=self.hold, takefocus=False).pack(
+        ttk.Checkbutton(buttons, text="Hold levers", variable=self.hold, takefocus=False).pack(
             side="left", padx=12)
         ttk.Button(buttons, text="Reset odometry", command=self.reset_odometry, takefocus=False).pack(
             side="left")
-        ttk.Label(right, text="Drag the lever to drive.  Space = stop,  Esc = quit.",
-                  foreground="#5f6b7a").grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(right, foreground="#5f6b7a", justify="left",
+                  text="Joystick: drive and turn.  Side levers: one track each.\n"
+                       "Let go to stop.  Space = stop,  Esc = quit.").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.status = tk.StringVar(value="starting...")
         self.status_label = ttk.Label(root, textvariable=self.status, anchor="w", padding=(10, 3),
@@ -432,10 +477,41 @@ class ManualControlApp:
 
     # ----------------------------------------------------------------- refresh
 
+    # ------------------------------------------------------------------ levers
+
+    def _on_joystick(self, x: float, y: float) -> None:
+        self._set_command(*arcade_mix(x, y))
+
+    def _on_joystick_release(self) -> None:
+        if not self.hold.get():
+            self.stop_robot()
+
+    def _on_track(self, index: int, value: float) -> None:
+        command = list(self._command)
+        command[index] = value
+        left, right = command
+        self.joystick.show((left - right) / 2, (left + right) / 2)  # same command, joystick view
+        self._set_command(left, right)
+
+    def _on_track_release(self, index: int) -> None:
+        if not self.hold.get():
+            self._on_track(index, 0.0)  # only this lever's track stops
+
+    def _set_command(self, left: float, right: float) -> None:
+        self._command = (left, right)
+        self.shared.set_command(left, right)
+        self._draw_track_levers()
+
+    def _draw_track_levers(self) -> None:
+        for lever, value in zip((self.left_lever, self.right_lever), self._command):
+            lever.show(value, value * self._max_speed)
+
     def _on_speed(self, value) -> None:
         speed = float(value)
+        self._max_speed = speed
         self.shared.set_max_speed(speed)
         self.speed_text.set(f"{speed:.0%}")
+        self._draw_track_levers()
 
     def _tick(self) -> None:
         if self.closing:
@@ -446,7 +522,6 @@ class ManualControlApp:
         if result is not None and result.count != self.steps_shown:
             self.steps_shown = result.count
             self._show_observation(result)
-        self.gauges.set(*self.shared.action())
         text, error = self.shared.status()
         self.status.set(text)
         self.status_label.configure(foreground="#b3261e" if error else "")
