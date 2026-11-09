@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# ELEGOO's kit download (422 MB of PDFs, zips, APK, 3D models) - vendor material,
+# keep it next to the repo rather than in it.
+ELEGOO Conqueror Robot Tank Kit*/
