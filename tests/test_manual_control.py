@@ -4,6 +4,7 @@ The Tk window is withdrawn, so nothing appears on screen; the test is skipped wh
 can't open a display at all (e.g. headless CI).
 """
 
+import contextlib
 import gc
 import importlib.util
 import re
@@ -14,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from robotgym import RoboGym
-from robotgym.fake_robot import FakeRobotServer
+from robotgym import RoboGym, SafetyConfig
+from robotgym.fake_robot import FakeRobotServer, SimRobot
 
 tk = pytest.importorskip("tkinter")
 
@@ -97,11 +98,13 @@ def root():
         pass  # the app already destroyed it
 
 
-@pytest.fixture
-def app_and_robot(root):
-    with FakeRobotServer() as fake:
+@contextlib.contextmanager
+def _running_app(root, robot=None, **env_kwargs):
+    """The app driving a fake robot (default ``SimRobot()``) until the block ends; then
+    checks that closing the window stopped the robot and disconnected."""
+    with FakeRobotServer(robot=robot) as fake:
         env = RoboGym(**fake.env_kwargs(), render_mode="rgb_array",
-                      reset_settle_time=0.05, calibrate_gyro_on_reset=False)
+                      reset_settle_time=0.05, calibrate_gyro_on_reset=False, **env_kwargs)
         app = mc.ManualControlApp(root, env, max_speed=0.8, show_plots=False)  # see test_plot_window
         app.start()
         try:
@@ -121,6 +124,19 @@ def app_and_robot(root):
         assert re.fullmatch(r"A,\d+,0,0,0", received[-2])  # ...right after a final stop
 
 
+@pytest.fixture
+def app_and_robot(root):
+    with _running_app(root) as running:
+        yield running
+
+
+@pytest.fixture
+def safe_app_and_robot(root):
+    """Safety layer on; the robot 0.46 m from a wall, facing it."""
+    with _running_app(root, robot=SimRobot(start=(2.45, 1.5, 0.0)), safety=SafetyConfig()) as running:
+        yield running
+
+
 def _label(lever) -> str:
     return lever.itemcget(lever.value_text, "text")
 
@@ -130,6 +146,7 @@ def test_joystick_drives_the_robot_and_the_window_shows_the_images(root, app_and
     assert app._camera_photo.width() == 640  # 320x240 stream, shown 2x
     assert app._obs_photo.width() == 2 * app.env.image_shape[1]
     assert app.status.get() == "connected"
+    assert app.latch.title.cget("text") == "Safety layer off" and not app.latch.latched
 
     start, frames = robot.x, app.camera_frames
     app.joystick.set(0.0, 1.0)  # joystick fully forward
@@ -266,3 +283,44 @@ def test_side_levers_drive_one_track_each(root, app_and_robot):
     assert _pump(root, until=lambda: robot.cmd == [0, 0])
     assert app.joystick.position == (0.0, 0.0)
     assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+
+
+def test_safety_latch_goes_red_holds_the_robot_and_clears(root, safe_app_and_robot):
+    app, robot = safe_app_and_robot
+    latch = app.latch
+    assert "armed" in latch.title.cget("text") and not latch.latched
+    assert str(latch.button.cget("state")) == "disabled"  # nothing to clear
+
+    app.hold.set(True)  # held forward: only the safety layer can stop it
+    app.joystick.set(0.0, 1.0)
+    app.joystick.release()
+    assert _pump(root, until=lambda: latch.latched)  # drove at the wall: tripped
+    assert latch.title.cget("text").startswith("SAFETY STOP")
+    assert latch.detail.cget("text").startswith("OBSTACLE")
+    assert str(latch.button.cget("state")) == "normal"
+    assert _pump(root, until=lambda: "SAFETY STOP" in app.readout.get())  # in the flags too
+    assert robot.cmd == [0, 0]  # the env stopped the robot itself...
+    assert app.joystick.position == (0.0, 0.0)  # ...and the window centred the levers
+    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+
+    app.joystick.set(-1.0, 0.0)  # latched: the levers move, but nothing is sent
+    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+    count = app.steps_shown
+    assert _pump(root, until=lambda: app.steps_shown >= count + 3)
+    assert robot.cmd == [0, 0] and latch.latched
+    app.stop_robot()
+
+    latch.button.invoke()  # Clear
+    assert latch.button.cget("text") == "Clearing\u2026"
+    assert _pump(root, until=lambda: not latch.latched)
+    assert "armed" in latch.title.cget("text")
+    count = app.steps_shown
+    assert _pump(root, until=lambda: app.steps_shown >= count + 2)
+    assert not latch.latched and robot.cmd == [0, 0]  # clearing doesn't drive off by itself
+
+    app.joystick.set(0.0, -1.0)  # backing away from the wall is allowed
+    assert _pump(root, until=lambda: robot.cmd == [-204, -204])
+    assert (_label(app.left_lever), _label(app.right_lever)) == ("-0.80", "-0.80")
+    app.stop_robot()
+    assert _pump(root, until=lambda: robot.cmd == [0, 0])
+    assert not latch.latched

@@ -15,6 +15,7 @@ from gymnasium import spaces
 from .camera import Frame, SnapshotCamera, StreamCamera, decode_jpeg, esp32_set
 from .link import ProtocolError, RobotLink, SerialTransport, TcpTransport
 from .protocol import RobotState, relative_pose, u32_diff
+from .safety import SafetyConfig, SafetyLayer
 
 logger = logging.getLogger("robotgym")
 
@@ -105,6 +106,11 @@ class RoboGym(gym.Env):
     command arrives or ``hold_timeout`` passes (then it stops by itself), so the deltas
     in an observation cover everything since the previous one, including the time the
     agent spent thinking.
+
+    ``safety=SafetyConfig()`` adds the PC-side safety layer (``env.safety``, see
+    :mod:`robotgym.safety`): it stops the robot when it stalls, fails to turn or nears an
+    obstacle, and holds it stopped until ``env.safety.clear()``. ``info["safety_trip"]``
+    is then the latched :class:`~robotgym.safety.SafetyTrip`, or None while armed.
     """
 
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 5}
@@ -130,6 +136,7 @@ class RoboGym(gym.Env):
         reset_settle_time: float = 0.5,
         calibrate_gyro_on_reset: bool = True,
         calibration: RobotCalibration | None = None,
+        safety: SafetyConfig | None = None,
         reward_fn: Callable[[dict, np.ndarray, dict], float] | None = None,
         terminated_fn: Callable[[dict, dict], bool] | None = None,
         render_mode: str | None = None,
@@ -162,6 +169,10 @@ class RoboGym(gym.Env):
             calibrate_gyro_on_reset: re-measure the gyro bias on every reset (~0.5 s,
                 the robot must be still).
             calibration: motor model constants, see :class:`RobotCalibration`.
+            safety: thresholds of the safety layer, see :class:`~robotgym.safety.SafetyConfig`;
+                None (default) = no safety layer. A trip latches until ``env.safety.clear()``;
+                end episodes on it with
+                ``terminated_fn=lambda obs, info: info["safety_trip"] is not None``.
             reward_fn: ``f(obs, action, info) -> float``; default 0.0.
             terminated_fn: ``f(obs, info) -> bool``; default never.
             render_mode: ``"rgb_array"`` (full-size camera frame) or ``"human"``
@@ -198,6 +209,7 @@ class RoboGym(gym.Env):
         self.reset_settle_time = float(reset_settle_time)
         self.calibrate_gyro_on_reset = calibrate_gyro_on_reset
         self.calibration = calibration if calibration is not None else RobotCalibration()
+        self.safety: SafetyLayer | None = SafetyLayer(safety) if safety is not None else None
         self.reward_fn = reward_fn
         self.terminated_fn = terminated_fn
         self.render_mode = render_mode
@@ -234,6 +246,7 @@ class RoboGym(gym.Env):
         self._window_open = False
         self._accel_rest: np.ndarray | None = None  # robot-frame reading at the last reset
         self._accel_v1_warned = False
+        self._last_pwm = (0, 0)  # what the robot is running now: the safety checks' baseline
 
     # ------------------------------------------------------------------ gym API
 
@@ -248,6 +261,7 @@ class RoboGym(gym.Env):
         options = options or {}
         self.connect()
         self._request("A", [0, 0, 0], self.timeout)
+        self._last_pwm = (0, 0)
         settle = float(options.get("settle_time", self.reset_settle_time))
         if settle > 0:
             time.sleep(settle)
@@ -262,6 +276,8 @@ class RoboGym(gym.Env):
         self._robot_rebooted = False
         self._low_battery_warned = False
         obs, info = self._observe(state, time.monotonic(), image_newer_than=t_sent)
+        if self.safety is not None:
+            info["safety_trip"] = self.safety.trip  # a reset doesn't clear the latch
         self._needs_reset = False
         if self.render_mode == "human":
             self.render()
@@ -275,14 +291,24 @@ class RoboGym(gym.Env):
             raise ValueError(f"action must be two finite numbers, got {action!r}")
         a = np.clip(a, -1.0, 1.0)
         left, right = self._action_to_pwm(a)
+        if self.safety is not None:  # zero while latched; forward refused near an obstacle
+            last = self._last_state
+            left, right = self.safety.command((left, right), last.distance if last is not None else None)
 
         t_sent = time.monotonic()
         duration_ms = round(self.action_duration * 1000)
         state = self._request("A", [left, right, duration_ms], self.action_duration + self.timeout)
+        prev_pwm, self._last_pwm = self._last_pwm, (left, right)
         t_reply = time.monotonic()
         obs, info = self._observe(state, t_reply, image_newer_than=t_sent + self.action_duration)
         info["pwm"] = (left, right)
         info["latency"] = max(0.0, t_reply - t_sent - self.action_duration)
+        if self.safety is not None:
+            if self.safety.check(prev_pwm, (left, right), obs, info) is not None:
+                # Stop now: the robot would keep running this step's action until the next command.
+                self._request("A", [0, 0, 0], self.timeout)
+                self._last_pwm = (0, 0)
+            info["safety_trip"] = self.safety.trip
 
         reward = float(self.reward_fn(obs, a, info)) if self.reward_fn else 0.0
         terminated = bool(self.terminated_fn(obs, info)) if self.terminated_fn else False

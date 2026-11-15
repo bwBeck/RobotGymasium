@@ -12,8 +12,10 @@ import gymnasium as gym
 
 from .env import RobotCalibration, RobotConnectionError, RoboGym
 from .protocol import PROTOCOL_VERSION, RobotState
+from .safety import SafetyConfig, SafetyLayer, SafetyTrip
 
-__all__ = ["PROTOCOL_VERSION", "RobotCalibration", "RobotConnectionError", "RobotState", "RoboGym"]
+__all__ = ["PROTOCOL_VERSION", "RobotCalibration", "RobotConnectionError", "RobotState", "RoboGym",
+           "SafetyConfig", "SafetyLayer", "SafetyTrip"]
 __version__ = "0.2.0"  # 0.2: accelerometer observation, protocol v2
 
 if "RoboGym-v0" not in gym.registry:

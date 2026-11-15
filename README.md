@@ -73,7 +73,8 @@ The defaults are a reward of 0.0 and never terminating. Limit episode length wit
 
 `info` also carries the cumulative odometry since `reset()` (`pose`,
 `motor_turns_total`), `accel_raw`, `battery_v`, `imu_ok`, `watchdog_stopped`,
-`robot_rebooted`, `latency`, `image_age` and the PWM actually sent (`pwm`).
+`robot_rebooted`, `latency`, `image_age`, the PWM actually sent (`pwm`), and with the
+safety layer on, `safety_trip`.
 
 ### What one step does
 
@@ -89,6 +90,27 @@ The defaults are a reward of 0.0 and never terminating. Limit episode length wit
 The robot sends cumulative values (odometry, turns, its clock) and the env differences
 them. So each observation covers everything since the previous one, including time the
 agent spent thinking, and a lost packet can't silently drop motion.
+
+### Safety layer
+
+`RoboGym(safety=SafetyConfig())` adds checks on the PC that stop the robot when its
+sensors disagree with what it was told to do:
+
+| trip | fires when |
+|---|---|
+| `stall` | a track is above PWM 100, the forward command (the tracks' mean PWM) changed by more than 50, but `accel` x stayed within ±0.3 m/s² |
+| `no_turn` | a track is above PWM 100, the tracks differ by more than 30, but the gyro's yaw rate stayed within ±2 deg/s |
+| `obstacle` | the ultrasonic range is under 0.15 m while driving forward. A forward command is also refused while the last reading is that close, but reversing and spinning stay allowed, so the robot can back away |
+
+A trip **latches**. The env stops the robot at once, then every step sends zero PWM until
+`env.safety.clear()`. `reset()` does not clear it. `info["safety_trip"]` holds the latched
+`SafetyTrip` (`.trigger`, `.message`), or `None` while armed. To end episodes on a trip, pass
+`terminated_fn=lambda obs, info: info["safety_trip"] is not None`.
+
+The checks run once per step on the PC, so they react a step late (~0.2 s). They add to the
+robot's own hold-timeout stop; they don't replace it. The thresholds are fields of
+`SafetyConfig`. Tune `min_accel` and `min_yaw_rate` for your robot with the manual-control
+plots: *accel x vs ΔPWM* and *yaw rate vs PWM L−R* show what it really does.
 
 ## Things to know about this hardware
 
@@ -166,6 +188,11 @@ keep it still for ~2 seconds after switching it on.
   *Max speed* scales all three; the side levers' labels show the speed actually sent.
 * **STOP** or **Space** always stops. *Reset odometry* calls `env.reset()`, and **Esc**
   or closing the window stops the robot and disconnects.
+* **The safety layer is on.** The panel under the levers says *Safety armed* while all is
+  well. When the layer stops the robot, the panel **latches red** with the reason and the
+  levers centre. The robot stays stopped, whatever the levers say, until you press
+  **Clear**. Clearing never restarts the robot by itself. `--no-safety` drives without the
+  layer.
 * **A plot window** opens beside it (the *Plots* button reopens it). It shows, one point per
   env step:
   * the PWM sent to the left and right tracks over the last 20 s;
@@ -187,7 +214,7 @@ keep it still for ~2 seconds after switching it on.
 The env runs in a background thread and steps it as fast as the robot answers (~5 Hz),
 so the window never waits for the robot. If the window freezes, that thread sends
 zero speed. Options: `--fake`, `--max-speed 0.6`, `--min-pwm 40` (small lever movements
-drive instead of sitting in the motor deadband), `--action-duration`. It needs
+drive instead of sitting in the motor deadband), `--action-duration`, `--no-safety`. It needs
 tkinter, which ships with Python. On Debian/Ubuntu: `sudo apt install python3-tk`.
 
 ## Calibration
@@ -225,6 +252,7 @@ improves `motor_turns`.
 | `min_pwm` | 0 | PWM for the smallest non-zero action. Set it near the deadband so small actions still move the robot |
 | `reset_settle_time` | 0.5 | pause after stopping in `reset()` before zeroing |
 | `calibrate_gyro_on_reset` | True | re-measure the gyro bias each reset (~0.5 s, robot must be still) |
+| `safety` | None | `SafetyConfig()` turns on the safety layer (see above) |
 | `serial_port` | None | e.g. `"/dev/ttyUSB0"`: drive over USB instead of WiFi (bench testing, switch on "Upload", `pip install pyserial`) |
 | `render_mode` | None | `"rgb_array"` returns the full camera frame; `"human"` opens a window (`pip install opencv-python`) |
 
@@ -260,12 +288,14 @@ ESP32 drops the connection after ~4 s. When the PC disconnects, the ESP32 sends
 
 ## Tests
 
-`pytest` runs four layers:
+`pytest` runs five layers:
 
 * `tests/test_protocol.py`: frame parsing and pose math.
 * `tests/test_env.py`: the full env against the fake robot. Covers spaces, motion signs,
   odometry consistency, the hold-timeout stop, heartbeats over idle periods, reconnects,
   retries, reboot detection, the camera modes and the gymnasium env checker.
+* `tests/test_safety.py`: the safety layer's checks on their own, then the env stopping
+  the fake robot at a wall, against a blocked reverse, and on tracks that slip instead of turning.
 * `tests/test_sketch_native.py`: compiles **the real `RoboGym.ino`** for your PC against
   small Arduino stand-ins (`tests/native/`) and drives it with the env. Includes a
   simulated `micros()` wraparound. Needs `g++`; skipped otherwise.

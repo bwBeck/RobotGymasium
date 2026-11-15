@@ -12,6 +12,11 @@ tracks, a side lever its own track. Tick "Hold levers" to make them stay where y
 them, e.g. to drive tank-style with the two side levers. The STOP button or Space always
 stops; Esc, closing the window or Ctrl+C in the terminal stops the robot and quits.
 
+The env's safety layer is on (``--no-safety`` turns it off). When it stops the robot (a
+stall, a turn that doesn't happen, an obstacle ahead) the panel under the levers latches
+red with the reason, the levers centre, and the robot stays stopped until you press its
+"Clear" button.
+
 The window shows the live camera feed, the image the agent receives in its observation,
 and the values of the latest observation. A second window (also opened by the "Plots"
 button) plots the PWM sent to each track and the accelerometer over the last 20 s, and
@@ -42,7 +47,7 @@ from tkinter import ttk
 import numpy as np
 from PIL import Image
 
-from robotgym import RoboGym, RobotConnectionError
+from robotgym import RoboGym, RobotConnectionError, SafetyConfig, SafetyTrip
 from robotgym.fake_robot import FakeRobotServer
 
 logger = logging.getLogger("manual_control")
@@ -92,6 +97,7 @@ def format_readout(r: StepResult) -> str:
     pwm_l, pwm_r = i.get("pwm", (0, 0))
     age = i.get("image_age")
     flags = [name for name, on in (
+        ("SAFETY STOP", i.get("safety_trip") is not None),
         ("IMU NOT OK", not i["imu_ok"]),
         ("watchdog stop", i["watchdog_stopped"]),
         ("ROBOT REBOOTED", i["robot_rebooted"]),
@@ -125,6 +131,8 @@ class Shared:
         self._reset_requested = False
         self._result: StepResult | None = None
         self._status = ("starting...", False)
+        self._safety_trip: SafetyTrip | None = None  # the env's latched trip, as last seen
+        self._safety_clear_requested = False
         # Every step, for the plots: (time, pwm_left, pwm_right, accel_x, accel_y, accel_z,
         # yaw_rate) - yaw rate in deg/s, counter-clockwise positive
         self._history: deque[tuple[float, ...]] = deque(maxlen=5000)
@@ -159,6 +167,26 @@ class Shared:
             requested, self._reset_requested = self._reset_requested, False
         return requested
 
+    def request_safety_clear(self) -> None:
+        with self._lock:
+            self._safety_clear_requested = True
+
+    def safety_clear_requested(self) -> bool:
+        with self._lock:
+            return self._safety_clear_requested
+
+    def safety_cleared(self) -> None:
+        """The env thread cleared the latch. One update, so the window never sees the
+        request gone while the old trip is still there."""
+        with self._lock:
+            self._safety_clear_requested = False
+            self._safety_trip = None
+
+    def safety(self) -> tuple[SafetyTrip | None, bool]:
+        """(latched trip or None, clear requested but not done yet)."""
+        with self._lock:
+            return self._safety_trip, self._safety_clear_requested
+
     def publish(self, result: StepResult) -> None:
         pwm_left, pwm_right = result.info.get("pwm", (0, 0))  # resets send no PWM
         accel = result.obs.get("accel", (0.0, 0.0, 0.0))
@@ -170,6 +198,8 @@ class Shared:
         with self._lock:
             self._result = result
             self._history.append(row)
+            if "safety_trip" in result.info:  # absent without a safety layer
+                self._safety_trip = result.info["safety_trip"]
 
     def history(self) -> list[tuple[float, ...]]:
         with self._lock:
@@ -205,6 +235,7 @@ class EnvRunner(threading.Thread):
     def run(self) -> None:
         try:
             while not self.stop_event.is_set():
+                self._clear_safety_if_requested()  # also while the robot is unreachable
                 try:
                     self._session()
                 except RobotConnectionError as exc:
@@ -228,6 +259,7 @@ class EnvRunner(threading.Thread):
                 self._reset()
                 last = time.monotonic()
                 continue
+            self._clear_safety_if_requested()
             action = self.shared.action()
             obs, _, terminated, truncated, info = self.env.step(action)
             now = time.monotonic()
@@ -237,6 +269,13 @@ class EnvRunner(threading.Thread):
             self._publish(obs, info, action, rate)
             if terminated or truncated:
                 self._reset()
+
+    def _clear_safety_if_requested(self) -> None:
+        """The latch is cleared here, on the thread that steps the env, as SafetyLayer requires."""
+        if self.shared.safety_clear_requested():
+            if self.env.safety is not None:
+                self.env.safety.clear()
+            self.shared.safety_cleared()
 
     def _reset(self) -> None:
         obs, info = self.env.reset()
@@ -358,6 +397,57 @@ class TrackLever(tk.Canvas):
     def _drag(self, event) -> None:
         value = max(-1.0, min(1.0, (self.mid - event.y) / self.half))
         self.set(0.0 if abs(value) < self.SNAP else value)
+
+
+class SafetyLatch(tk.Frame):
+    """The env's safety layer: quiet while armed; once it trips, a red latch with the reason
+    and a "Clear" button. Every state has the same size, so the window never resizes."""
+
+    RED, RED_DARK, GREEN, GREY = "#d93025", "#b3261e", "#1e8e3e", "#5f6b7a"
+
+    def __init__(self, master: tk.Misc, on_clear, bg: str, wrap: int = 320):
+        """``wrap``: the reason's line width [px] until the panel knows its own width."""
+        super().__init__(master, padx=8, pady=5, highlightthickness=1)
+        self.bg = bg
+        self.title = tk.Label(self, anchor="w", font=("TkDefaultFont", 10, "bold"))
+        self.button = tk.Button(self, text="Clear", width=9, command=on_clear, takefocus=False,
+                                font=("TkDefaultFont", 9, "bold"), pady=1)
+        self.detail = tk.Label(self, anchor="nw", justify="left", height=2, wraplength=wrap,
+                               font=("TkDefaultFont", 9))
+        self.title.grid(row=0, column=0, sticky="w")
+        self.button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.detail.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.columnconfigure(0, weight=1)
+        # Wrap the reason at the panel's width, which the widgets around it decide.
+        self.bind("<Configure>", lambda e: self.detail.configure(wraplength=max(wrap, e.width - 20)))
+
+    def show_off(self) -> None:
+        self._paint(False, "Safety layer off", "The env has no safety layer (--no-safety): only you and "
+                    "the robot's hold timeout stop it.", self.GREY, "Clear", enabled=False)
+
+    def show_armed(self, config: SafetyConfig) -> None:
+        self._paint(False, "\u25cf Safety armed",
+                    f"Stops the robot on a stall, a turn that doesn't happen, or an obstacle "
+                    f"closer than {config.min_distance:.2f} m ahead.", self.GREEN, "Clear", enabled=False)
+
+    def show_tripped(self, trip: SafetyTrip, clearing: bool) -> None:
+        self._paint(True, "SAFETY STOP - robot held stopped", trip.message, "white",
+                    "Clearing\u2026" if clearing else "Clear", enabled=not clearing)
+
+    @property
+    def latched(self) -> bool:
+        return self.cget("bg") == self.RED
+
+    def _paint(self, red: bool, title: str, detail: str, title_fg: str, button: str, enabled: bool) -> None:
+        bg = self.RED if red else self.bg
+        self.configure(bg=bg, highlightbackground=self.RED_DARK if red else "#c8d0d8")
+        self.title.configure(text=title, bg=bg, fg=title_fg)
+        self.detail.configure(text=detail, bg=bg, fg="white" if red else self.GREY)
+        self.button.configure(text=button, state="normal" if enabled else "disabled",
+                              bg="white" if red else self.bg, fg=self.RED_DARK,
+                              activebackground="#fde8e7", activeforeground=self.RED_DARK,
+                              disabledforeground=_blend(self.RED, 0.45) if red else "#a0a8b0",
+                              highlightbackground=bg)
 
 
 PLOT_COLORS = {"left": "#2f6fd6", "right": "#e8833a", "x": "#d93025", "y": "#1e8e3e", "z": "#8e44ad",
@@ -574,6 +664,8 @@ class ManualControlApp:
         self._command = (0.0, 0.0)  # [left, right], -1..1: what all three levers show
         self._max_speed = max_speed
         self._tick_error: str | None = None
+        self._safety_trip: SafetyTrip | None = None  # the latched trip the window has seen
+        self._latch_shown: tuple | None = None  # what the latch panel shows now
         self.plot_seconds = plot_seconds
         self.plots: PlotWindow | None = None
         self._plots_dirty = False
@@ -624,6 +716,11 @@ class ManualControlApp:
     def stop_robot(self) -> None:
         self.joystick.show(0.0, 0.0)
         self._set_command(0.0, 0.0)
+
+    def clear_safety(self) -> None:
+        """The latch's "Clear" button: the env thread releases the latch before its next step."""
+        self.shared.request_safety_clear()
+        self._refresh_safety()  # shows "Clearing..." now, not on the next refresh
 
     def reset_odometry(self) -> None:
         self.stop_robot()
@@ -695,8 +792,15 @@ class ManualControlApp:
         self.left_lever.pack(side="left")
         self.right_lever.pack(side="left")
 
+        self.latch = SafetyLatch(right, self.clear_safety, bg=bg or "#dcdad5")
+        self.latch.grid(row=3, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        if self.env.safety is None:
+            self.latch.show_off()
+        else:
+            self.latch.show_armed(self.env.safety.config)
+
         speed = ttk.Frame(right)
-        speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        speed.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(speed, text="Max speed").pack(side="left")
         self.speed_text = tk.StringVar()
         scale = ttk.Scale(speed, from_=0.1, to=1.0, orient="horizontal", length=140,
@@ -709,7 +813,7 @@ class ManualControlApp:
         self._on_speed(max_speed)
 
         buttons = ttk.Frame(right)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
         tk.Button(buttons, text="STOP", command=self.stop_robot, bg="#d93025", fg="white",
                   activebackground="#b3261e", activeforeground="white", font=bold, width=7,
                   takefocus=False).pack(side="left")
@@ -720,7 +824,7 @@ class ManualControlApp:
         ttk.Label(right, foreground="#5f6b7a", justify="left",
                   text="Joystick: drive and turn.  Side levers: one track each.\n"
                        "Let go to stop.  Space = stop,  Esc = quit.").grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.status = tk.StringVar(value="starting...")
         self.status_label = ttk.Label(root, textvariable=self.status, anchor="w", padding=(10, 3),
@@ -759,8 +863,9 @@ class ManualControlApp:
         self._draw_track_levers()
 
     def _draw_track_levers(self) -> None:
+        held = self._safety_trip is not None  # latched: the env sends zero whatever the levers say
         for lever, value in zip((self.left_lever, self.right_lever), self._command):
-            lever.show(value, value * self._max_speed)
+            lever.show(value, 0.0 if held else value * self._max_speed)
 
     def _on_speed(self, value) -> None:
         speed = float(value)
@@ -780,6 +885,7 @@ class ManualControlApp:
                 self.steps_shown = result.count
                 self._show_observation(result)
                 self._plots_dirty = True
+            self._refresh_safety()
             now = time.monotonic()
             # Redraw on new data, and once a second anyway so the time axis keeps rolling.
             if self.plots is not None and (self._plots_dirty or now - self._plots_drawn_at > 1.0):
@@ -796,6 +902,23 @@ class ManualControlApp:
         self.status.set(text)
         self.status_label.configure(foreground="#b3261e" if error else "")
         self.root.after(UI_PERIOD_MS, self._tick)
+
+    def _refresh_safety(self) -> None:
+        if self.env.safety is None:
+            return  # the panel says "off" for good
+        trip, clearing = self.shared.safety()
+        new_trip = trip is not None and trip is not self._safety_trip
+        self._safety_trip = trip
+        if new_trip:  # centre the levers, so clearing the latch never drives off by itself
+            self.stop_robot()
+        shown = (trip, clearing and trip is not None)
+        if shown != self._latch_shown:
+            self._latch_shown = shown
+            if trip is None:
+                self.latch.show_armed(self.env.safety.config)
+            else:
+                self.latch.show_tripped(trip, clearing)
+            self._draw_track_levers()
 
     def _refresh_camera(self) -> None:
         frame = self.env.render()  # newest full-size frame; safe while the runner steps
@@ -841,6 +964,8 @@ def main() -> None:
                              "small movements drive instead of doing nothing")
     parser.add_argument("--action-duration", type=float, default=0.1,
                         help="seconds per env step before the robot reports back (default 0.1)")
+    parser.add_argument("--no-safety", action="store_true",
+                        help="drive without the env's safety layer (stall / no-turn / obstacle stop)")
     parser.add_argument("--no-plots", action="store_true",
                         help="don't open the plot window at start (the Plots button still does)")
     parser.add_argument("--plot-seconds", type=float, default=20.0,
@@ -854,7 +979,7 @@ def main() -> None:
         parser.exit(1, f"cannot open a window: {exc}\n")
     max_speed = min(max(args.max_speed, 0.1), 1.0)
     env_kwargs = {"render_mode": "rgb_array", "action_duration": args.action_duration,
-                  "min_pwm": args.min_pwm}
+                  "min_pwm": args.min_pwm, "safety": None if args.no_safety else SafetyConfig()}
     app_kwargs = {"max_speed": max_speed, "show_plots": not args.no_plots,
                   "plot_seconds": max(args.plot_seconds, 1.0)}
     with contextlib.ExitStack() as stack:
