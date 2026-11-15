@@ -21,7 +21,7 @@ def test_reset_returns_zero_deltas_and_configures_the_camera(fake, make_env):
     obs, info = env.reset()
     assert env.observation_space.contains(obs)
     assert obs["image"].shape == (120, 160, 3) and obs["image"].std() > 10
-    for key in ("delta_pose", "motor_turns", "dt", "robot_dt"):
+    for key in ("delta_pose", "motor_turns", "dt", "robot_dt", "accel"):
         assert not obs[key].any(), key
     # Facing a wall 1.5 m away (sensor sits 9 cm ahead of the centre).
     assert obs["distance"][0] == pytest.approx(1.41, abs=0.02)
@@ -67,6 +67,55 @@ def test_deltas_add_up_to_the_cumulative_odometry(make_env):
     assert heading == pytest.approx(info["pose"][2], abs=2e-3)
     np.testing.assert_allclose(turns, info["motor_turns_total"], atol=2e-3)
     assert robot_time > 0.5
+
+
+def test_accel_is_the_mean_acceleration_with_the_rest_reading_removed(make_env):
+    env = make_env(camera="none")
+    obs, info = env.reset()
+    # Raw: gravity on z plus the simulated chip offsets; the observation subtracts it.
+    assert info["accel_raw"] == pytest.approx([0.12, -0.08, 9.81 + 0.15], abs=0.05)
+    obs, *_ = env.step([0.8, 0.8])  # speeding up from standstill
+    assert obs["accel"][0] > 0.8 and abs(obs["accel"][1]) < 0.1 and abs(obs["accel"][2]) < 0.1
+    env.step([0.8, 0.8])
+    obs, *_ = env.step([0.0, 0.0])  # braking
+    assert obs["accel"][0] < -0.8
+    for _ in range(3):
+        obs, *_ = env.step([0.0, 0.0])  # parked
+    assert np.abs(obs["accel"]).max() < 0.05
+
+
+def test_imu_forward_maps_the_chip_axes_to_the_robot(fake):
+    # The simulated chip has its -y axis pointing forward; tell the env so.
+    with FakeRobotServer(robot=SimRobot(imu_forward="-y")) as fake2:
+        env = RoboGym(**fake2.env_kwargs(), **FAST, camera="none",
+                      calibration=RobotCalibration(imu_forward="-y"))
+        try:
+            env.reset()
+            obs, *_ = env.step([0.8, 0.8])
+            assert obs["accel"][0] > 0.8 and abs(obs["accel"][1]) < 0.1
+        finally:
+            env.close()
+    with pytest.raises(ValueError, match="imu_forward"):
+        RoboGym(calibration=RobotCalibration(imu_forward="up"))
+
+
+def test_old_sketch_without_accelerometer_still_works(caplog):
+    class OldSketch(SimRobot):  # protocol v1: no accelerometer fields
+        def _emit(self, text):
+            if text.startswith("{O,"):
+                text = text[:-1].rsplit(",", 3)[0] + "}"
+            super()._emit(text)
+
+    with FakeRobotServer(robot=OldSketch()) as fake:
+        env = RoboGym(**fake.env_kwargs(), **FAST, camera="none")
+        try:
+            obs, info = env.reset()
+            obs, *_ = env.step([0.5, 0.5])
+            assert not obs["accel"].any() and info["accel_raw"] is None
+            assert obs["delta_pose"][0] > 0  # everything else still works
+            assert "reflash" in caplog.text
+        finally:
+            env.close()
 
 
 def test_camera_view_changes_when_the_robot_turns(make_env):

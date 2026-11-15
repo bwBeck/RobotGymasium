@@ -97,6 +97,9 @@ def test_sketch_reports_sensors_and_motion(env):
     assert info["imu_ok"]
     assert info["battery_v"] == pytest.approx(7.90)
     assert obs["distance"][0] == pytest.approx(1.0, abs=0.03)
+    # Simulated chip: offsets (150, -80, 60) LSB on top of 1 g, at 1.197 mm/s^2 per LSB.
+    assert info["accel_raw"] == pytest.approx([0.180, -0.096, 9.878], abs=0.002)
+    assert not obs["accel"].any()  # the reset's at-rest reading is the zero point
 
     obs, _, _, _, info = env.step([0.8, 0.8])
     dx, dy, dth = obs["delta_pose"]
@@ -106,6 +109,8 @@ def test_sketch_reports_sensors_and_motion(env):
     assert dx == pytest.approx(obs["motor_turns"][0] * 3.14159 * 0.043, rel=0.02)
     assert abs(dy) < 1e-3 and abs(dth) < 1e-3
     assert obs["robot_dt"][0] == pytest.approx(obs["dt"][0], abs=0.05)
+    # The chip pushes +x while both tracks drive forward: it shows up as forward accel.
+    assert obs["accel"][0] > 0.3 and abs(obs["accel"][1]) < 0.01 and abs(obs["accel"][2]) < 0.01
 
     obs, *_ = env.step([-0.8, 0.8])  # turn left
     assert obs["delta_pose"][2] > 0.3

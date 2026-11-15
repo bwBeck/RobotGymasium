@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 from PIL import Image
 
+from .env import STANDARD_GRAVITY, RobotCalibration, imu_rotation
 from .protocol import FLAG_BOOT, FLAG_IMU_OK, FLAG_NO_ECHO, FLAG_WATCHDOG, PROTOCOL_VERSION, FrameParser
 
 # ESP32 frame size index -> (width, height), as in ELEGOO's firmware build.
@@ -78,20 +79,27 @@ class SimRobot:
     SKID = 0.8  # tracks slip when turning: true rotation vs ideal differential drive
     SENSOR_OFFSET = 0.09  # m, ultrasonic sensor ahead of the centre
     CALIBRATION_TIME = 0.45  # s the sketch spends measuring the gyro bias on R
+    REST_SAMPLE_TIME = 0.12  # s it averages the accelerometer on R without gyro calibration
+    ACCEL_OFFSET = (0.12, -0.08, 0.15)  # m/s^2 in the chip's axes, like a real MPU6050's
+    ACCEL_NOISE = 0.05  # m/s^2 per sample
 
     def __init__(self, arena_size: float = 3.0, start=(1.5, 1.5, 0.0), battery_v: float = 7.9,
-                 baud: int = 9600, seed: int = 0):
+                 baud: int = 9600, seed: int = 0, imu_forward: str = "+x"):
         self.arena = arena_size
         self.battery_v = battery_v
         self.byte_time = 10.0 / baud if baud else 0.0
         self.rng = np.random.default_rng(seed)
         self.received: list[str] = []  # every frame the "UNO" got, for tests
+        # How the simulated MPU6050 is mounted: robot axes -> chip axes.
+        self._robot_to_imu = imu_rotation(RobotCalibration(imu_forward=imu_forward)).T
 
         self.x, self.y, self.th = start  # true pose in the arena
         self.rps = [0.0, 0.0]
         self.cmd = [0, 0]
+        self._v_true = 0.0
         self._default_config()
         self._zero_odometry()
+        self._clear_accel()
         self.flags = FLAG_BOOT
         self.pending: tuple[int, float] | None = None
 
@@ -152,6 +160,7 @@ class SimRobot:
         with self._cond:
             self._default_config()
             self._zero_odometry()
+            self._clear_accel()
             self.cmd = [0, 0]
             self.rps = [0.0, 0.0]
             self.pending = None
@@ -172,6 +181,11 @@ class SimRobot:
     def _zero_odometry(self) -> None:
         self.ox = self.oy = self.oth = self.heading = 0.0
         self.turns = [0.0, 0.0]
+
+    def _clear_accel(self) -> None:
+        self._accel_sum = np.zeros(3)
+        self._accel_count = 0
+        self._accel_last = self._robot_to_imu @ (0.0, 0.0, STANDARD_GRAVITY) + self.ACCEL_OFFSET
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -211,7 +225,8 @@ class SimRobot:
             self.cmd = [0, 0]
             self.rps = [0.0, 0.0]
             self._zero_odometry()
-            self.pending = (seq, now + (self.CALIBRATION_TIME if v[1] else 0.0))
+            self._clear_accel()  # the reply averages only the still period, like the sketch
+            self.pending = (seq, now + (self.CALIBRATION_TIME if v[1] else self.REST_SAMPLE_TIME))
         elif kind == "C" and n == 8:
             self.hold_timeout = _clamp(v[1], 50, 60000) / 1000.0
             self.max_rps = _clamp(v[2], 1, 100000) / 600.0
@@ -247,9 +262,21 @@ class SimRobot:
         mid = self.th + 0.5 * omega * dt
         nx, ny = self.x + v * math.cos(mid) * dt, self.y + v * math.sin(mid) * dt
         lo, hi = self.RADIUS, self.arena - self.RADIUS
-        if lo <= nx <= hi and lo <= ny <= hi:
+        moved = lo <= nx <= hi and lo <= ny <= hi
+        if moved:
             self.x, self.y = nx, ny
         self.th += omega * dt
+
+        # Accelerometer: speed changes (a wall stops it dead), turning, gravity.
+        if dt > 0:
+            v_true = v if moved else 0.0
+            robot_frame = ((v_true - self._v_true) / dt, v_true * omega, STANDARD_GRAVITY)
+            self._v_true = v_true
+            sample = (self._robot_to_imu @ robot_frame + self.ACCEL_OFFSET
+                      + self.rng.normal(0.0, self.ACCEL_NOISE, 3))
+            self._accel_sum += sample
+            self._accel_count += 1
+            self._accel_last = sample
 
         # What the sketch computes: gyro heading + motor-model distance (walls unknown).
         w = self.gyro_sign * omega
@@ -278,11 +305,14 @@ class SimRobot:
         dist = self._range_mm()
         flags = self.flags | FLAG_IMU_OK | (FLAG_NO_ECHO if dist >= 4000 else 0)
         t_us = int((now - self._boot) * 1e6) & 0xFFFFFFFF
-        self._emit("{O,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d}" % (
+        mean = self._accel_sum / self._accel_count if self._accel_count else self._accel_last
+        ax, ay, az = (round(a * 1000) for a in mean)  # mm/s^2
+        self._emit("{O,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d}" % (
             seq, t_us, int(self.ox * 1e4), int(self.oy * 1e4), int(self.oth * 1e4),
             int(self.turns[0] * 1e3), int(self.turns[1] * 1e3), dist,
-            round(self.battery_v * 100), flags))
+            round(self.battery_v * 100), flags, ax, ay, az))
         self.flags = 0
+        self._clear_accel()
         self.last_reply = now
 
     # ----------------------------------------------------------------- camera

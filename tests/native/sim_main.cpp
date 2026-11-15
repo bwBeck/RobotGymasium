@@ -2,9 +2,10 @@
 //
 // Serial is stdin/stdout. Around the sketch sits a tiny "robot" built from the shield's
 // wiring (TB6612 build): the gyro reports a yaw rate proportional to the difference of
-// the track commands (positive = counter-clockwise, as on the kit), the ultrasonic
-// sensor echoes an obstacle 1.000 m away and the battery reads 7.90 V. micros() starts
-// 3 s before its 32-bit wrap so wrap handling is exercised in every run.
+// the track commands (positive = counter-clockwise, as on the kit), the accelerometer
+// reads +1 g up plus fixed offsets and pushes forward while both tracks drive forward,
+// the ultrasonic sensor echoes an obstacle 1.000 m away and the battery reads 7.90 V.
+// micros() starts 3 s before its 32-bit wrap so wrap handling is exercised in every run.
 #include <Arduino.h>
 #include <Wire.h>
 #include <fcntl.h>
@@ -24,6 +25,9 @@ static const unsigned long MICROS_START = 0xFFFFFFFFUL - 3000000UL;
 static const double OBSTACLE_MM = 1000.0;
 static const int GYRO_BIAS_LSB = 37;
 static const double MAX_YAW_RATE = 3.0;  // rad/s for full opposite track commands
+// Accelerometer at +-4 g (8192 LSB/g), chip x = forward: offsets + gravity on z.
+static const int ACCEL_OFFSET[3] = {150, -80, 8192 + 60};
+static const int ACCEL_FORWARD_LSB = 1200;  // extra x while both tracks command full forward
 
 static struct timespec t0;
 static uint8_t pinState[20];
@@ -83,8 +87,27 @@ static int16_t gyroZRaw() {
   return (int16_t)raw;
 }
 
+static int16_t accelRaw(int axis) {
+  double forward = 0.5 * (trackCommand(6, 8) + trackCommand(5, 7));
+  return (int16_t)(ACCEL_OFFSET[axis] + (axis == 0 ? ACCEL_FORWARD_LSB * forward : 0.0));
+}
+
+// Register value of the simulated MPU6050 (big-endian 16-bit words).
+static uint8_t mpuRegister(uint8_t reg) {
+  if (reg == 0x75) return 0x68;  // WHO_AM_I
+  int16_t word;
+  if (reg >= 0x3B && reg <= 0x40) {
+    word = accelRaw((reg - 0x3B) / 2);
+  } else if (reg == 0x47 || reg == 0x48) {
+    word = gyroZRaw();
+  } else {
+    return 0;  // temperature, gyro x/y: unused by the sketch
+  }
+  return (reg % 2 == 1) ? (uint8_t)((uint16_t)word >> 8) : (uint8_t)(word & 0xFF);
+}
+
 // ---- Wire: an MPU6050 at 0x68 ----
-static uint8_t wireReg = 0, wireOut[8];
+static uint8_t wireReg = 0, wireOut[16];
 static int wireOutLen = 0, wireOutPos = 0, wireTxCount = 0;
 
 void TwoWire::begin() {}
@@ -100,12 +123,7 @@ uint8_t TwoWire::requestFrom(uint8_t address, uint8_t quantity) {
   if (address != 0x68) return 0;
   wireOutLen = wireOutPos = 0;
   for (uint8_t i = 0; i < quantity && i < sizeof(wireOut); i++) {
-    uint8_t reg = wireReg + i, value = 0;
-    int16_t g = gyroZRaw();
-    if (reg == 0x75) value = 0x68;  // WHO_AM_I
-    if (reg == 0x47) value = (uint8_t)((uint16_t)g >> 8);
-    if (reg == 0x48) value = (uint8_t)(g & 0xFF);
-    wireOut[wireOutLen++] = value;
+    wireOut[wireOutLen++] = mpuRegister(wireReg + i);
   }
   return (uint8_t)wireOutLen;
 }

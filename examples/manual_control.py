@@ -13,7 +13,11 @@ them, e.g. to drive tank-style with the two side levers. The STOP button or Spac
 stops; Esc, closing the window or Ctrl+C in the terminal stops the robot and quits.
 
 The window shows the live camera feed, the image the agent receives in its observation,
-and the values of the latest observation. The env runs in a background thread that steps
+and the values of the latest observation. A second window (also opened by the "Plots"
+button) plots the PWM sent to each track and the accelerometer over the last 20 s, and
+scatters each accelerometer axis against the PWM and against the change in PWM since the
+previous step (ΔPWM), and the gyro's yaw rate against the left - right PWM difference
+(and their changes), one dot per env step. The env runs in a background thread that steps
 as fast as the robot answers (~5 Hz) with whatever the levers say, so the window never
 waits for the robot.
 
@@ -23,13 +27,16 @@ Needs tkinter, which comes with Python (Debian/Ubuntu: sudo apt install python3-
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
 import logging
 import math
 import signal
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from tkinter import ttk
 
 import numpy as np
@@ -73,12 +80,14 @@ class StepResult:
     action: np.ndarray
     count: int  # increments with every step and reset
     rate: float  # steps per second, smoothed
+    stamp: float = field(default_factory=time.monotonic)  # when the step finished
 
 
 def format_readout(r: StepResult) -> str:
     o, i = r.obs, r.info
     dx, dy, dth = (float(v) for v in o["delta_pose"])
     turns_l, turns_r = (float(v) for v in o["motor_turns"])
+    ax, ay, az = (float(v) for v in o["accel"])
     x, y, th = (float(v) for v in i["pose"])
     pwm_l, pwm_r = i.get("pwm", (0, 0))
     age = i.get("image_age")
@@ -95,6 +104,7 @@ def format_readout(r: StepResult) -> str:
         + (f"     image age {age:.2f} s" if age is not None else ""),
         f"delta_pose dx {dx:+.4f} m   dy {dy:+.4f} m   dtheta {dth:+.4f} rad",
         f"turns      left {turns_l:+.3f}   right {turns_r:+.3f}   (estimated)",
+        f"accel      x {ax:+.2f}   y {ay:+.2f}   z {az:+.2f} m/s^2   (mean over the step)",
         f"dt         {float(o['dt'][0]):.3f} s   robot_dt {float(o['robot_dt'][0]):.3f} s"
         f"   latency {i.get('latency', 0.0):.3f} s",
         f"pose       x {x:+.3f} m   y {y:+.3f} m   theta {th:+.3f} rad   (since reset)",
@@ -115,6 +125,9 @@ class Shared:
         self._reset_requested = False
         self._result: StepResult | None = None
         self._status = ("starting...", False)
+        # Every step, for the plots: (time, pwm_left, pwm_right, accel_x, accel_y, accel_z,
+        # yaw_rate) - yaw rate in deg/s, counter-clockwise positive
+        self._history: deque[tuple[float, ...]] = deque(maxlen=5000)
 
     def set_command(self, left: float, right: float) -> None:
         with self._lock:
@@ -147,8 +160,24 @@ class Shared:
         return requested
 
     def publish(self, result: StepResult) -> None:
+        pwm_left, pwm_right = result.info.get("pwm", (0, 0))  # resets send no PWM
+        accel = result.obs.get("accel", (0.0, 0.0, 0.0))
+        # The gyro's mean output over the step: measured heading change / step duration.
+        dtheta = float(result.obs["delta_pose"][2])
+        robot_dt = float(result.obs["robot_dt"][0])
+        yaw_rate = math.degrees(dtheta / robot_dt) if robot_dt > 0 else 0.0
+        row = (result.stamp, float(pwm_left), float(pwm_right), *(float(a) for a in accel), yaw_rate)
         with self._lock:
             self._result = result
+            self._history.append(row)
+
+    def history(self) -> list[tuple[float, ...]]:
+        with self._lock:
+            return list(self._history)
+
+    def clear_history(self) -> None:
+        with self._lock:
+            self._history.clear()
 
     def latest(self) -> StepResult | None:
         with self._lock:
@@ -331,10 +360,205 @@ class TrackLever(tk.Canvas):
         self.set(0.0 if abs(value) < self.SNAP else value)
 
 
+PLOT_COLORS = {"left": "#2f6fd6", "right": "#e8833a", "x": "#d93025", "y": "#1e8e3e", "z": "#8e44ad",
+               "yaw": "#00897b"}
+# Distinct shapes keep coinciding points visible (e.g. left = right PWM when driving straight).
+PLOT_MARKERS = {"left": "dot", "right": "ring", "x": "dot", "y": "square", "z": "ring", "yaw": "dot"}
+_MARKER_LAYER = {"square": 0, "dot": 1, "ring": 2}  # big filled first, rings on top
+
+
+def nice_ticks(lo: float, hi: float, target: int = 6) -> list[float]:
+    """Round tick values (1, 2 or 5 x 10^k apart) covering [lo, hi]."""
+    span = hi - lo
+    if span <= 0:
+        return [lo]
+    magnitude = 10.0 ** math.floor(math.log10(span / target))
+    step = next(m * magnitude for m in (1, 2, 5, 10) if span / (m * magnitude) <= target)
+    k = math.ceil(lo / step - 1e-9)
+    ticks = []
+    while k * step <= hi + 1e-9 * step:
+        ticks.append(k * step + 0.0)  # integer multiples: no accumulated rounding; +0.0 kills -0
+        k += 1
+    return ticks
+
+
+def _tick_labels(ticks: list[float]) -> list[str]:
+    step = ticks[1] - ticks[0] if len(ticks) > 1 else 1.0
+    decimals = max(0, -math.floor(math.log10(step) + 1e-9))
+    return [f"{t:.{decimals}f}" for t in ticks]
+
+
+def _blend(color: str, amount: float) -> str:
+    """Mixes a #rrggbb colour with white."""
+    rgb = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(c + (255 - c) * amount) for c in rgb)
+
+
+class Plot(tk.Canvas):
+    """A small live plot: auto-scaled axes with round ticks and one marker per point,
+    optionally joined by a faint line. Cheap enough to redraw at the step rate."""
+
+    LEFT, RIGHT, TOP, BOTTOM = 52, 12, 26, 34
+
+    def __init__(self, master: tk.Misc, width: int, height: int, title: str, xlabel: str,
+                 ylabel: str, series: list[tuple[str, str, str]], *, xlim=None, ylim=None,
+                 min_span: float = 1.0, join: bool = False):
+        super().__init__(master, width=width, height=height, bg="white", highlightthickness=1,
+                         highlightbackground="#c8d0d8")
+        self.series = series  # [(name, colour, marker)], marker: "dot", "square" or "ring"
+        self.xlim, self.ylim, self.min_span, self.join = xlim, ylim, min_span, join
+        self.box = (self.LEFT, self.TOP, width - self.RIGHT, height - self.BOTTOM)
+        x0, y0, x1, y1 = self.box
+        self.create_text(x0, 13, text=title, anchor="w", fill="#1f2933", font=("TkDefaultFont", 9, "bold"))
+        x = x1
+        for name, color, marker in reversed(series):  # legend, right-aligned
+            label = self.create_text(x, 13, text=name, anchor="e", fill="#3c4650", font=("TkDefaultFont", 8))
+            x = self.bbox(label)[0] - 8
+            self._marker(x, 13, color, marker, tags=())
+            x -= 10
+        self.create_text((x0 + x1) / 2, height - 7, text=xlabel, fill="#5f6b7a", font=("TkDefaultFont", 8))
+        self.create_text(11, (y0 + y1) / 2, text=ylabel, angle=90, fill="#5f6b7a", font=("TkDefaultFont", 8))
+        self.redraw({})
+
+    def redraw(self, data: dict, xlim=None) -> None:
+        """Redraws axes and points. ``data`` maps a series name to (xs, ys)."""
+        self.delete("dyn")
+        xlim = xlim or self.xlim or self._limits([v[0] for v in data.values()])
+        ylim = self.ylim or self._limits([v[1] for v in data.values()])
+        x0, y0, x1, y1 = self.box
+        sx = (x1 - x0) / (xlim[1] - xlim[0])
+        sy = (y1 - y0) / (ylim[1] - ylim[0])
+        small = ("TkDefaultFont", 8)
+        ticks = nice_ticks(*xlim)
+        for v, text in zip(ticks, _tick_labels(ticks)):
+            px = x0 + (v - xlim[0]) * sx
+            self.create_line(px, y0, px, y1, fill="#eef1f5", tags="dyn")
+            self.create_text(px, y1 + 9, text=text, fill="#5f6b7a", font=small, tags="dyn")
+        ticks = nice_ticks(*ylim)
+        for v, text in zip(ticks, _tick_labels(ticks)):
+            py = y1 - (v - ylim[0]) * sy
+            self.create_line(x0, py, x1, py, fill="#eef1f5", tags="dyn")
+            self.create_text(x0 - 4, py, text=text, anchor="e", fill="#5f6b7a", font=small, tags="dyn")
+        if ylim[0] < 0 < ylim[1]:
+            py = y1 + ylim[0] * sy
+            self.create_line(x0, py, x1, py, fill="#9aa5b1", tags="dyn")
+        self.create_rectangle(x0, y0, x1, y1, outline="#9aa5b1", tags="dyn")
+        for name, color, marker in sorted(self.series, key=lambda s: _MARKER_LAYER[s[2]]):
+            if name not in data:
+                continue
+            xs = np.clip(x0 + (np.asarray(data[name][0], float) - xlim[0]) * sx, x0, x1)
+            ys = np.clip(y1 - (np.asarray(data[name][1], float) - ylim[0]) * sy, y0, y1)
+            if self.join and len(xs) > 1:
+                self.create_line(*np.column_stack((xs, ys)).ravel().tolist(),
+                                 fill=_blend(color, 0.6), tags="dyn")
+            for px, py in zip(xs.tolist(), ys.tolist()):
+                self._marker(px, py, color, marker, tags=("dyn", "point"))
+
+    def _marker(self, x: float, y: float, color: str, marker: str, tags) -> None:
+        if marker == "ring":
+            self.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, width=1.5, tags=tags)
+        elif marker == "square":
+            self.create_rectangle(x - 3, y - 3, x + 3, y + 3, fill=color, outline="", tags=tags)
+        else:
+            self.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=color, outline="", tags=tags)
+
+    def _limits(self, arrays) -> tuple[float, float]:
+        values = np.concatenate([np.asarray(a, float) for a in arrays]) if arrays else np.empty(0)
+        values = values[np.isfinite(values)]
+        lo = min(float(values.min()), 0.0) if values.size else 0.0  # keep 0 in view
+        hi = max(float(values.max()), 0.0) if values.size else 0.0
+        if hi - lo < self.min_span:
+            mid = (hi + lo) / 2
+            lo, hi = mid - self.min_span / 2, mid + self.min_span / 2
+        pad = 0.08 * (hi - lo)
+        return lo - pad, hi + pad
+
+
+class PlotWindow:
+    """Second window: the PWM sent and the accelerometer over a rolling time window; each
+    accelerometer axis against the PWM of both tracks and against the change in PWM since
+    the previous step; and, for turning, the gyro's yaw rate against the left - right PWM
+    difference and its change against the change in that difference."""
+
+    MAX_STEP_GAP_S = 1.0  # a longer gap (pause, reconnect, reset) has no meaningful PWM change
+
+    def __init__(self, root: tk.Tk, seconds: float, on_close, on_clear):
+        self.seconds = seconds
+        self.window = tk.Toplevel(root)
+        self.window.title("RoboGym plots - PWM and accelerometer")
+        self.window.resizable(False, False)
+        self.window.protocol("WM_DELETE_WINDOW", on_close)
+        frame = ttk.Frame(self.window, padding=8)
+        frame.grid(row=0, column=0)
+        tracks = [(name, PLOT_COLORS[name], PLOT_MARKERS[name]) for name in ("left", "right")]
+        axes = [(name, PLOT_COLORS[name], PLOT_MARKERS[name]) for name in "xyz"]
+        yaw = [("yaw", PLOT_COLORS["yaw"], PLOT_MARKERS["yaw"])]
+        # Four rows sized to fit a 768-pixel-high screen; the 4th column is for turning.
+        self.pwm_plot = Plot(frame, 1040, 140, "Motor PWM sent", "time (s)", "PWM", tracks,
+                             ylim=(-275, 275), join=True)
+        self.accel_plot = Plot(frame, 1040, 140, "Accelerometer (mean over each step, robot frame)",
+                               "time (s)", "m/s²", axes, join=True)
+        self.scatters = [Plot(frame, 254, 180, f"accel {a} vs PWM", "PWM", f"accel {a} (m/s²)",
+                              tracks, xlim=(-275, 275)) for a in "xyz"]
+        self.change_scatters = [Plot(frame, 254, 180, f"accel {a} vs ΔPWM",
+                                     "ΔPWM since the previous step", f"accel {a} (m/s²)",
+                                     tracks, xlim=(-540, 540)) for a in "xyz"]
+        # Counter-clockwise yaw is positive, so it comes with right > left: a falling slope.
+        self.turn_scatter = Plot(frame, 254, 180, "yaw rate vs PWM L-R", "PWM left - right",
+                                 "yaw rate (deg/s)", yaw, xlim=(-540, 540), min_span=10.0)
+        self.turn_change_scatter = Plot(frame, 254, 180, "Δyaw rate vs Δ(L-R)", "Δ(PWM left - right)",
+                                        "Δyaw rate (deg/s)", yaw, xlim=(-1080, 1080), min_span=10.0)
+        self.pwm_plot.grid(row=0, column=0, columnspan=4)
+        self.accel_plot.grid(row=1, column=0, columnspan=4, pady=(5, 0))
+        for row, plots in ((2, [*self.scatters, self.turn_scatter]),
+                           (3, [*self.change_scatters, self.turn_change_scatter])):
+            for i, plot in enumerate(plots):
+                plot.grid(row=row, column=i, padx=(0 if i == 0 else 6, 0), pady=(5, 0))
+        controls = ttk.Frame(frame)
+        controls.grid(row=4, column=0, columnspan=4, sticky="w", pady=(5, 0))
+        ttk.Button(controls, text="Clear", command=on_clear, takefocus=False).pack(side="left")
+        self.info = tk.StringVar()
+        ttk.Label(controls, textvariable=self.info, foreground="#5f6b7a").pack(side="left", padx=10)
+        self.window.after(300, lambda: self._place_beside(root))
+
+    def redraw(self, history, now: float) -> None:
+        """``history`` rows: (time, pwm_left, pwm_right, accel_x, accel_y, accel_z, yaw_rate)."""
+        everything = np.array(history, dtype=float).reshape(-1, 7)
+        # Changes since the previous step (PWM left, PWM right, yaw rate). A PWM change
+        # takes effect at the start of a step, so it pairs with that step's response.
+        # Undefined for the first step and after a gap (pause, reconnect, reset).
+        change = np.full((len(everything), 3), np.nan)
+        change[1:] = np.diff(everything[:, [1, 2, 6]], axis=0)
+        change[1:][np.diff(everything[:, 0]) > self.MAX_STEP_GAP_S] = np.nan
+
+        recent = now - everything[:, 0] <= self.seconds
+        rows, change = everything[recent], change[recent]
+        t = rows[:, 0] - now
+        pwm_l, pwm_r, ax, ay, az, yaw = rows[:, 1:].T
+        window = (-self.seconds, 0.0)
+        self.pwm_plot.redraw({"left": (t, pwm_l), "right": (t, pwm_r)}, xlim=window)
+        self.accel_plot.redraw({"x": (t, ax), "y": (t, ay), "z": (t, az)}, xlim=window)
+        ok = ~np.isnan(change[:, 0])
+        d_left, d_right, d_yaw = change[ok].T
+        for accel, plot, change_plot in zip((ax, ay, az), self.scatters, self.change_scatters):
+            plot.redraw({"left": (pwm_l, accel), "right": (pwm_r, accel)})
+            change_plot.redraw({"left": (d_left, accel[ok]), "right": (d_right, accel[ok])})
+        self.turn_scatter.redraw({"yaw": (pwm_l - pwm_r, yaw)})
+        self.turn_change_scatter.redraw({"yaw": (d_left - d_right, d_yaw)})
+        self.info.set(f"{len(rows)} steps in the last {self.seconds:.0f} s - one dot per env step")
+
+    def _place_beside(self, root: tk.Tk) -> None:
+        """Next to the main window if the screen has room; otherwise the window manager decides."""
+        x = root.winfo_x() + root.winfo_width() + 10
+        if x + self.window.winfo_width() <= root.winfo_screenwidth():
+            self.window.geometry(f"+{x}+{root.winfo_y()}")
+
+
 class ManualControlApp:
     """The window. Only this (main) thread touches Tk; the env lives in an EnvRunner."""
 
-    def __init__(self, root: tk.Tk, env: RoboGym, max_speed: float = 0.6):
+    def __init__(self, root: tk.Tk, env: RoboGym, max_speed: float = 0.6, show_plots: bool = True,
+                 plot_seconds: float = 20.0):
         self.root = root
         self.env = env
         self.shared = Shared(max_speed)
@@ -349,7 +573,33 @@ class ManualControlApp:
         self._obs_photo: tk.PhotoImage | None = None
         self._command = (0.0, 0.0)  # [left, right], -1..1: what all three levers show
         self._max_speed = max_speed
+        self._tick_error: str | None = None
+        self.plot_seconds = plot_seconds
+        self.plots: PlotWindow | None = None
+        self._plots_dirty = False
+        self._plots_drawn_at = 0.0
         self._build(max_speed)
+        if show_plots:
+            self.open_plots()
+
+    def open_plots(self) -> PlotWindow:
+        """Opens the plot window, or brings it to the front if it is already open."""
+        if self.plots is None:
+            self.plots = PlotWindow(self.root, self.plot_seconds, self._close_plots, self.clear_history)
+            self._plots_dirty = True
+        else:
+            self.plots.window.deiconify()
+            self.plots.window.lift()
+        return self.plots
+
+    def clear_history(self) -> None:
+        self.shared.clear_history()
+        self._plots_dirty = True
+
+    def _close_plots(self) -> None:
+        if self.plots is not None:
+            self.plots.window.destroy()
+            self.plots = None
 
     def start(self) -> None:
         self.runner.start()
@@ -359,13 +609,17 @@ class ManualControlApp:
         """start() and run the window until it closes. Ctrl+C quits cleanly too."""
         # Without this, Ctrl+C either escapes mainloop mid-step or gets swallowed by
         # Tk's callback wrapper. Instead: stop the robot and close like the window does.
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        for sig in previous:
             signal.signal(sig, lambda *_: self.root.after(0, self.quit))
         self.start()
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
             self.quit()
+        finally:  # the handlers reference this app; don't keep it (and Tk) alive
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
     def stop_robot(self) -> None:
         self.joystick.show(0.0, 0.0)
@@ -445,11 +699,13 @@ class ManualControlApp:
         speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(speed, text="Max speed").pack(side="left")
         self.speed_text = tk.StringVar()
-        scale = ttk.Scale(speed, from_=0.1, to=1.0, orient="horizontal", length=200,
+        scale = ttk.Scale(speed, from_=0.1, to=1.0, orient="horizontal", length=140,
                           command=self._on_speed, takefocus=False)
         scale.set(max_speed)
         scale.pack(side="left", padx=8)
         ttk.Label(speed, textvariable=self.speed_text, width=5).pack(side="left")
+        ttk.Button(speed, text="Plots", command=self.open_plots, takefocus=False).pack(
+            side="left", padx=(4, 0))
         self._on_speed(max_speed)
 
         buttons = ttk.Frame(right)
@@ -516,13 +772,27 @@ class ManualControlApp:
     def _tick(self) -> None:
         if self.closing:
             return
-        self.shared.touch()
-        self._refresh_camera()
-        result = self.shared.latest()
-        if result is not None and result.count != self.steps_shown:
-            self.steps_shown = result.count
-            self._show_observation(result)
-        text, error = self.shared.status()
+        try:
+            self.shared.touch()
+            self._refresh_camera()
+            result = self.shared.latest()
+            if result is not None and result.count != self.steps_shown:
+                self.steps_shown = result.count
+                self._show_observation(result)
+                self._plots_dirty = True
+            now = time.monotonic()
+            # Redraw on new data, and once a second anyway so the time axis keeps rolling.
+            if self.plots is not None and (self._plots_dirty or now - self._plots_drawn_at > 1.0):
+                self.plots.redraw(self.shared.history(), now)
+                self._plots_dirty = False
+                self._plots_drawn_at = now
+            text, error = self.shared.status()
+            self._tick_error = None
+        except Exception as exc:  # never let one bad refresh freeze the window
+            text, error = f"window refresh failed: {exc!r} (details in the terminal)", True
+            if repr(exc) != self._tick_error:  # log each new error once, not 25 times a second
+                logger.exception("window refresh failed")
+                self._tick_error = repr(exc)
         self.status.set(text)
         self.status_label.configure(foreground="#b3261e" if error else "")
         self.root.after(UI_PERIOD_MS, self._tick)
@@ -571,6 +841,10 @@ def main() -> None:
                              "small movements drive instead of doing nothing")
     parser.add_argument("--action-duration", type=float, default=0.1,
                         help="seconds per env step before the robot reports back (default 0.1)")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="don't open the plot window at start (the Plots button still does)")
+    parser.add_argument("--plot-seconds", type=float, default=20.0,
+                        help="how many seconds the plots show (default 20)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -581,11 +855,23 @@ def main() -> None:
     max_speed = min(max(args.max_speed, 0.1), 1.0)
     env_kwargs = {"render_mode": "rgb_array", "action_duration": args.action_duration,
                   "min_pwm": args.min_pwm}
-    if args.fake:
-        with FakeRobotServer() as fake:
-            ManualControlApp(root, RoboGym(**fake.env_kwargs(), **env_kwargs), max_speed).run()
-    else:
-        ManualControlApp(root, RoboGym(host=args.host, **env_kwargs), max_speed).run()
+    app_kwargs = {"max_speed": max_speed, "show_plots": not args.no_plots,
+                  "plot_seconds": max(args.plot_seconds, 1.0)}
+    with contextlib.ExitStack() as stack:
+        if args.fake:
+            fake = stack.enter_context(FakeRobotServer())
+            env = RoboGym(**fake.env_kwargs(), **env_kwargs)
+        else:
+            env = RoboGym(host=args.host, **env_kwargs)
+        app = ManualControlApp(root, env, **app_kwargs)
+        app.run()
+        # Free Tk now, on the main thread. Tcl aborts the whole process if the garbage
+        # collector happens to free its interpreter on another thread (e.g. the fake
+        # robot's, still running here); pausing automatic collection rules that out.
+        gc.disable()
+        del app, env, root
+        gc.collect()
+        gc.enable()
 
 
 if __name__ == "__main__":

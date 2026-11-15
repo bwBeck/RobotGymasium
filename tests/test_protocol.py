@@ -42,7 +42,8 @@ def test_parser_resyncs_on_open_brace_and_drops_oversized_frames():
 
 
 def test_parse_observation():
-    msg = parse_frame("O,12,4294967295,12345,-500,31416,2500,-1250,876,784,%d" % (FLAG_IMU_OK | FLAG_NO_ECHO))
+    msg = parse_frame("O,12,4294967295,12345,-500,31416,2500,-1250,876,784,%d,0,0,9810"
+                      % (FLAG_IMU_OK | FLAG_NO_ECHO))
     assert isinstance(msg, RobotState)
     assert msg.seq == 12 and msg.t_us == 0xFFFFFFFF
     assert msg.x == pytest.approx(1.2345) and msg.y == pytest.approx(-0.05)
@@ -54,8 +55,16 @@ def test_parse_observation():
 
 
 def test_parse_observation_invalid_distance_and_boot_flag():
-    msg = parse_frame("O,1,0,0,0,0,0,0,-1,790,%d" % FLAG_BOOT)
+    msg = parse_frame("O,1,0,0,0,0,0,0,-1,790,%d,0,0,9810" % FLAG_BOOT)
     assert msg.distance is None and msg.booted
+
+
+def test_parse_observation_accelerometer_fields():
+    msg = parse_frame("O,1,0,0,0,0,0,0,500,790,1,180,-96,9878")
+    assert msg.accel == (pytest.approx(0.18), pytest.approx(-0.096), pytest.approx(9.878))
+    # A protocol-v1 sketch (before accelerometer support) still parses, without accel.
+    old = parse_frame("O,1,0,0,0,0,0,0,500,790,1")
+    assert isinstance(old, RobotState) and old.accel is None
 
 
 def test_parse_other_frames():
@@ -63,6 +72,7 @@ def test_parse_other_frames():
     assert parse_frame("E,9,1") == RobotError(9, 1)
     assert parse_frame("Heartbeat") == "Heartbeat"
     assert parse_frame("O,1,2,3") is None  # wrong field count
+    assert parse_frame("O,1,0,0,0,0,0,0,500,790,1,180") is None
     assert parse_frame("O,a,b,c,d,e,f,g,h,i,j") is None
 
 

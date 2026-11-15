@@ -8,6 +8,7 @@ room, in this order, and pass the printed values to RoboGym(calibration=...):
     python examples/calibrate.py spin                  # gyro sign
     python examples/calibrate.py deadband              # PWM where the tracks start moving
     python examples/calibrate.py straight --pwm 200    # drive, then type the measured distance
+    python examples/calibrate.py imu                   # which accelerometer axis points forward
 
 Add --fake to try any of them on the simulated robot.
 """
@@ -91,10 +92,37 @@ def straight(env: RoboGym, args, fake) -> None:
           f"(with sprocket_diameter={env.calibration.sprocket_diameter})")
 
 
+def imu(env: RoboGym, args, fake) -> None:
+    """Drive off sharply a few times; the chip axis that jumps is the forward one."""
+    votes = []
+    for trial in range(3):
+        env.action_duration = 0.15
+        env.reset()  # stops the robot; the reset's reading is the at-rest one
+        rest = env.last_state.accel
+        if rest is None:
+            print("the robot's sketch has no accelerometer output yet - reflash arduino/RoboGym/RoboGym.ino")
+            return
+        env.step(pwm(args.pwm, args.pwm))  # speeding up from standstill
+        change = np.array(env.last_state.accel) - rest  # chip axes, gravity cancelled
+        env.action_duration = 0.6
+        env.step(pwm(0, 0))  # stop
+        axis = int(np.argmax(np.abs(change[:2])))
+        votes.append(("+" if change[axis] > 0 else "-") + "xy"[axis])
+        print(f"run {trial + 1}: change in chip x/y/z = {np.round(change, 2)} m/s^2 -> forward is {votes[-1]}")
+    best = max(set(votes), key=votes.count)
+    if votes.count(best) < 2:
+        print("inconsistent runs - try a higher --pwm on a smooth floor")
+        return
+    print(f"-> RobotCalibration(imu_forward={best!r})")
+    up = "up" if rest[2] > 0 else "down"
+    print(f"(at rest the chip's z axis reads {rest[2]:+.2f} m/s^2: it points {up}; "
+          f"gyro_sign {'1' if up == 'up' else '-1'} should match that)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=["spin", "deadband", "straight"])
-    parser.add_argument("--pwm", type=int, default=180, help="PWM for spin / straight (0-255)")
+    parser.add_argument("mode", choices=["spin", "deadband", "straight", "imu"])
+    parser.add_argument("--pwm", type=int, default=180, help="PWM for spin / straight / imu (0-255)")
     parser.add_argument("--seconds", type=float, default=1.5, help="drive time for spin / straight")
     parser.add_argument("--deadband", type=float, default=RobotCalibration.deadband_pwm,
                         help="your measured deadband (for straight)")
@@ -102,7 +130,7 @@ def main() -> None:
     parser.add_argument("--fake", action="store_true", help="use the simulated robot")
     args = parser.parse_args()
 
-    run = {"spin": spin, "deadband": deadband, "straight": straight}[args.mode]
+    run = {"spin": spin, "deadband": deadband, "straight": straight, "imu": imu}[args.mode]
     calibration = RobotCalibration(deadband_pwm=args.deadband)
     kwargs = {"camera": "none", "calibration": calibration, "hold_timeout": 1.0}
     if args.fake:

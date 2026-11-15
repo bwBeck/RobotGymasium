@@ -51,6 +51,17 @@ firmware: nothing to flash there.
 | `distance` | (1,) float32 | ultrasonic range in metres; `max_distance` (4 m) when nothing is in range |
 | `dt` | (1,) float32 | time since the last observation, measured on the PC |
 | `robot_dt` | (1,) float32 | time since the robot's last packet, measured by the robot's own clock |
+| `accel` | (3,) float32 | MPU6050 accelerometer, **averaged over the step**, robot frame (x forward, y left, z up) in m/s², minus the at-rest reading taken at `reset()`: ~0 when still, + while speeding up, − while braking |
+
+About `accel`:
+- Averaging over the step smooths out track vibration, and the average equals the change in
+  velocity divided by the step's duration.
+- The at-rest reading taken at each reset is subtracted, which cancels the chip's own
+  offsets and gravity on a level floor.
+- `info["accel_raw"]` has the same average without that subtraction, so gravity
+  (~9.8 m/s² on z) is included.
+- Which way the chip faces is set by `RobotCalibration(imu_forward=...)`. Find it with
+  `calibrate.py imu` (see Calibration below).
 
 **Action:** `Box(-1, 1, shape=(2,))` = `[left, right]` track speed. The sign is the
 direction, and ±1 is full PWM (`max_pwm`).
@@ -61,8 +72,8 @@ The defaults are a reward of 0.0 and never terminating. Limit episode length wit
 `gym.make("RoboGym-v0", max_episode_steps=200)` or `gymnasium.wrappers.TimeLimit`.
 
 `info` also carries the cumulative odometry since `reset()` (`pose`,
-`motor_turns_total`), `battery_v`, `imu_ok`, `watchdog_stopped`, `robot_rebooted`,
-`latency`, `image_age` and the PWM actually sent (`pwm`).
+`motor_turns_total`), `accel_raw`, `battery_v`, `imu_ok`, `watchdog_stopped`,
+`robot_rebooted`, `latency`, `image_age` and the PWM actually sent (`pwm`).
 
 ### What one step does
 
@@ -91,8 +102,8 @@ agent spent thinking, and a lost packet can't silently drop motion.
   D4, D9 and A0–A2 unused, but the shield wires them to its button, RGB LED, IR receiver
   and line sensors.
 * **About 5 steps per second.** ELEGOO's ESP32 firmware links to the UNO at 9600 baud.
-  An action plus its reply is ~80 characters, about 80 ms on the wire, on top of
-  `action_duration`. With the defaults, a step takes ~0.17–0.2 s.
+  An action plus its reply is ~95 characters, about 100 ms on the wire, on top of
+  `action_duration`. With the defaults, a step takes ~0.19–0.22 s.
 * **The robot is the WiFi access point.** While your PC is on `ELEGOO-xxxxxxxx` it
   usually has no internet, unless it has a second network adapter.
 * **One client at a time.** Close the ELEGOO phone app before connecting.
@@ -123,6 +134,10 @@ against it: `python -m robotgym.fake_robot` and connect with the printed argumen
    upload.
 4. Set the switch **back to "Cam"**. Otherwise the ESP32 can't talk to the UNO.
 
+Re-flash whenever you update this repo and the sketch changed. If the robot runs an
+older sketch, the env still works but logs a warning, and anything that sketch doesn't
+send (such as `accel`, added in protocol v2) reads 0.
+
 At boot the robot centres the camera/ultrasonic servo and measures the gyro bias, so
 keep it still for ~2 seconds after switching it on.
 
@@ -151,6 +166,23 @@ keep it still for ~2 seconds after switching it on.
   *Max speed* scales all three; the side levers' labels show the speed actually sent.
 * **STOP** or **Space** always stops. *Reset odometry* calls `env.reset()`, and **Esc**
   or closing the window stops the robot and disconnects.
+* **A plot window** opens beside it (the *Plots* button reopens it). It shows, one point per
+  env step:
+  * the PWM sent to the left and right tracks over the last 20 s;
+  * the accelerometer (`accel`, x/y/z) over the same window;
+  * scatter plots of accel x, y and z against the PWM of both tracks;
+  * scatter plots of accel x, y and z against **ΔPWM**, the change in PWM since the previous
+    step. A command change takes effect at the start of a step, so it lines up with that
+    step's acceleration, which makes this the clearer view of how the tracks respond. It's
+    skipped after gaps over 1 s (pauses, reconnects, resets);
+  * a turning column: the gyro's **yaw rate** (heading change ÷ step time, deg/s,
+    counter-clockwise positive) against the **left − right PWM difference**, and the change
+    in yaw rate against the change in that difference. Right > left turns the robot
+    counter-clockwise, so expect a falling slope.
+
+  Overlapping series use different marker shapes, e.g. left = dot and right = ring, so
+  equal values stay visible. *Clear* starts the plots fresh. `--no-plots` skips the plot
+  window at start, and `--plot-seconds 30` changes the time window.
 
 The env runs in a background thread and steps it as fast as the robot answers (~5 Hz),
 so the window never waits for the robot. If the window freezes, that thread sends
@@ -161,19 +193,20 @@ tkinter, which ships with Python. On Debian/Ubuntu: `sudo apt install python3-tk
 ## Calibration
 
 The motor model's defaults are rough guesses. `examples/calibrate.py` measures better
-values using the gyro. Run it on the floor, in this order:
+values using the gyro and accelerometer. Run it on the floor, in this order:
 
 ```bash
 python examples/calibrate.py spin                  # is the gyro sign right?
 python examples/calibrate.py deadband              # PWM where the tracks start moving
 python examples/calibrate.py straight --pwm 200 --deadband 42   # then type the distance you measured
+python examples/calibrate.py imu                   # which accelerometer axis points forward
 ```
 
 Then pass the results in:
 
 ```python
 from robotgym import RoboGym, RobotCalibration
-env = RoboGym(calibration=RobotCalibration(max_rpm=165, deadband_pwm=42))
+env = RoboGym(calibration=RobotCalibration(max_rpm=165, deadband_pwm=42, imu_forward="+x"))
 ```
 
 The values are sent to the robot each time the env connects, so recalibrating never
@@ -217,8 +250,8 @@ header has the full description.
 | | `{R,seq,calib}` | stop, optionally recalibrate the gyro, zero odometry; reply `O` |
 | | `{C,seq,hold_ms,rpm×10,deadband,tau_ms,sprocket_0.1mm,track_mm,gyro_sign}` | configure; reply `O` |
 | | `{P,seq}` | reply `O` now |
-| robot → PC | `{O,seq,t_us,x,y,θ,turnsL,turnsR,dist_mm,batt_cV,flags}` | x, y in 0.1 mm; θ in 1e-4 rad; turns in 1e-3; flags: 1 IMU ok, 2 watchdog stop, 4 no echo, 8 first packet since boot, 16 gyro calibration failed |
-| | `{H,RoboGym,1}` | boot banner |
+| robot → PC | `{O,seq,t_us,x,y,θ,turnsL,turnsR,dist_mm,batt_cV,flags,ax,ay,az}` | x, y in 0.1 mm; θ in 1e-4 rad; turns in 1e-3; flags: 1 IMU ok, 2 watchdog stop, 4 no echo, 8 first packet since boot, 16 gyro calibration failed; a: accelerometer mean since the last packet, mm/s², chip axes, gravity included (the reply to R covers only the still period, so it is the at-rest reading) |
+| | `{H,RoboGym,2}` | boot banner with the protocol version |
 | | `{E,seq,code}` | rejected command |
 
 The PC also sends `{Heartbeat}` every 0.5 s, which the ESP32 requires. Without it the
@@ -255,3 +288,4 @@ received the commands. It then names the broken part.
 | tracks run the wrong way | set `INVERT_LEFT_MOTOR` / `INVERT_RIGHT_MOTOR` in the sketch, or check `MOTOR_DRIVER` |
 | `dθ` has the wrong sign | `calibrate.py spin`, then `RobotCalibration(gyro_sign=-1)` |
 | `robot_rebooted` in `info` | battery brown-out when the motors start: charge the battery |
+| new features missing, or errors about keys like `accel` | `robotgym` was installed as a copy (`pip install .`): reinstall with `pip install -e .` so it follows the repo |

@@ -14,7 +14,7 @@ from .env import RobotCalibration, RobotConnectionError, RoboGym
 from .protocol import PROTOCOL_VERSION, RobotState
 
 __all__ = ["PROTOCOL_VERSION", "RobotCalibration", "RobotConnectionError", "RobotState", "RoboGym"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # 0.2: accelerometer observation, protocol v2
 
 if "RoboGym-v0" not in gym.registry:
     gym.register(id="RoboGym-v0", entry_point="robotgym.env:RoboGym", nondeterministic=True)

@@ -48,7 +48,7 @@
       {P,seq}                    poll: reply O immediately, change nothing.
 
     robot -> PC
-      {O,seq,t_us,x,y,th,turnsL,turnsR,dist_mm,batt_cV,flags}
+      {O,seq,t_us,x,y,th,turnsL,turnsR,dist_mm,batt_cV,flags,ax,ay,az}
           t_us    micros() when the packet was built (wraps every ~71 minutes)
           x, y    dead-reckoned position since the last R, 0.1 mm (x forward, y left at reset)
           th      heading since the last R, 1e-4 rad, counter-clockwise positive, unwrapped
@@ -58,7 +58,11 @@
           flags   1 IMU ok | 2 watchdog stopped the motors since the last packet
                   | 4 no echo (nothing in range) | 8 first packet since boot
                   | 16 gyro calibration failed (robot was moving)
-      {H,RoboGym,1}              sent once at boot
+          a       MPU6050 accelerometer, mean since the previous packet, mm/s^2, in the
+                  chip's own axes, gravity included (the PC rotates it into the robot frame).
+                  The reply to R averages only the still period of the reset, so it is the
+                  at-rest reading the PC subtracts.
+      {H,RoboGym,2}              sent once at boot
       {E,seq,code}               command rejected (1 = malformed)
 
     The ESP32 sends {"N":100} when the PC disconnects (treated as STOP), plus chatter of
@@ -102,7 +106,7 @@
 #define NOMINAL_BATTERY_V 7.4f
 #define MIN_MOTOR_BATTERY_V 5.0f  // below this the battery is off (USB power only): motors can't turn
 
-const uint8_t PROTOCOL_VERSION = 1;
+const uint8_t PROTOCOL_VERSION = 2;
 
 // ==================================== pins =====================================
 
@@ -148,6 +152,9 @@ const float GYRO_BIAS_TRACK_TAU_S = 5.0f;
 const int16_t GYRO_BIAS_TRACK_WINDOW = 131;     // only track the bias when |rate| < ~2 deg/s
 const uint32_t PARKED_SETTLE_US = 500000UL;     // motors off this long = robot is still
 const uint8_t GYRO_MAX_FAILED_READS = 25;       // ~100 ms of I2C errors -> give up on the IMU
+const float ACCEL_MMS2_PER_LSB = 9806.65f / 8192.0f;  // +-4 g full scale
+const uint16_t ACCEL_WINDOW_MAX = 60000;        // samples per mean (~4 min); keeps the sums in range
+const uint8_t ACCEL_REST_SAMPLES = 60;          // still-period average on a reset without gyro calibration
 
 const uint32_t TICK_US = 4000;              // 250 Hz model / gyro integration
 const uint32_t PING_PERIOD_US = 60000;      // HC-SR04 wants >= 60 ms between pings
@@ -208,6 +215,9 @@ bool imuOk = false;
 float gyroBias = 0.0f;  // LSB
 float lastOmega = 0.0f;  // rad/s
 uint8_t gyroFailedReads = 0;
+long accelSum[3] = {0, 0, 0};  // raw LSB summed since the last packet
+uint16_t accelCount = 0;
+int16_t accelLast[3] = {0, 0, 0};
 
 // Odometry since the last reset: 0.1 mm, 0.1 mm, 1e-4 rad, 1e-3 turn, 1e-3 turn.
 Accum odoX, odoY, odoTh, turnsLeft, turnsRight;
@@ -310,15 +320,36 @@ static int mpuRead(uint8_t reg) {
   return Wire.read();
 }
 
-static bool readGyroZ(int16_t &out) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write((uint8_t)0x47);  // GYRO_ZOUT_H
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom(MPU_ADDR, (uint8_t)2) != 2) return false;
+static int16_t readWord() {
   uint8_t hi = Wire.read();  // separate statements: operand evaluation order is unspecified
   uint8_t lo = Wire.read();
-  out = (int16_t)(((uint16_t)hi << 8) | lo);
+  return (int16_t)(((uint16_t)hi << 8) | lo);
+}
+
+// One burst from ACCEL_XOUT_H (0x3B) to GYRO_ZOUT_L (0x48): accel xyz, temp, gyro xyz.
+static bool readImu(int16_t *accel, int16_t &gyroZ) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write((uint8_t)0x3B);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, (uint8_t)14) != 14) return false;
+  for (uint8_t i = 0; i < 3; i++) accel[i] = readWord();
+  for (uint8_t i = 0; i < 3; i++) readWord();  // temperature, gyro x, gyro y: unused
+  gyroZ = readWord();
   return true;
+}
+
+static void clearAccel() {
+  accelSum[0] = accelSum[1] = accelSum[2] = 0;
+  accelCount = 0;
+}
+
+static void addAccel(const int16_t *accel) {
+  if (accelCount >= ACCEL_WINDOW_MAX) clearAccel();  // no packet for minutes: start a new mean
+  for (uint8_t i = 0; i < 3; i++) {
+    accelSum[i] += accel[i];
+    accelLast[i] = accel[i];
+  }
+  accelCount++;
 }
 
 static bool initImu() {
@@ -334,19 +365,22 @@ static bool initImu() {
   bool ok = mpuWrite(0x6B, 0x01)    // wake up, clock = PLL on gyro X
             && mpuWrite(0x1A, 0x04)  // DLPF: gyro ~20 Hz bandwidth
             && mpuWrite(0x19, 0x00)  // sample rate divider: 1 kHz
-            && mpuWrite(0x1B, 0x08); // gyro full scale +-500 deg/s
+            && mpuWrite(0x1B, 0x08)  // gyro full scale +-500 deg/s
+            && mpuWrite(0x1C, 0x08); // accel full scale +-4 g (bumps clip at 2 g)
   delay(50);
   return ok;
 }
 
-// Averages the gyro at rest. Fails (keeping the old bias) if the robot moved.
+// Averages the gyro at rest. Fails (keeping the old bias) if the robot moved. The
+// accelerometer samples go into the running mean, so it reports the at-rest reading.
 static bool calibrateGyro() {
   long sum = 0;
   int16_t lo = 32767, hi = -32768;
   uint16_t n = 0;
   for (uint16_t i = 0; i < GYRO_CALIB_SAMPLES; i++) {
-    int16_t g;
-    if (readGyroZ(g)) {
+    int16_t accel[3], g;
+    if (readImu(accel, g)) {
+      addAccel(accel);
       sum += g;
       if (g < lo) lo = g;
       if (g > hi) hi = g;
@@ -358,6 +392,16 @@ static bool calibrateGyro() {
   if (n < GYRO_CALIB_SAMPLES / 2 || (int32_t)hi - (int32_t)lo > GYRO_CALIB_MAX_SPREAD) return false;
   gyroBias = (float)sum / n;
   return true;
+}
+
+// A short still-period accelerometer average, for a reset without gyro calibration.
+static void sampleAccelAtRest() {
+  for (uint8_t i = 0; i < ACCEL_REST_SAMPLES; i++) {
+    int16_t accel[3], g;
+    if (readImu(accel, g)) addAccel(accel);
+    delayMicroseconds(1500);
+  }
+  wdt_reset();
 }
 
 // ================================== battery ====================================
@@ -442,8 +486,9 @@ static void tick(uint32_t now, float dt) {
   // Yaw rate: gyro when available, otherwise the skid-steer estimate.
   float omega;
   if (imuOk) {
-    int16_t raw;
-    if (readGyroZ(raw)) {
+    int16_t accel[3], raw;
+    if (readImu(accel, raw)) {
+      addAccel(accel);
       gyroFailedReads = 0;
       float centered = raw - gyroBias;
       if (parked && fabs(centered) < GYRO_BIAS_TRACK_WINDOW) {
@@ -480,13 +525,21 @@ static void sendObservation(uint16_t seq) {
   uint8_t flags = latchedFlags;
   if (imuOk) flags |= FLAG_IMU_OK;
   if (rangeNoEcho) flags |= FLAG_NO_ECHO;
-  char buf[112];
-  int n = snprintf(buf, sizeof(buf), "{O,%u,%lu,%ld,%ld,%ld,%ld,%ld,%d,%d,%u}", (unsigned)seq,
-                   (unsigned long)micros(), (long)odoX.whole, (long)odoY.whole, (long)odoTh.whole,
-                   (long)turnsLeft.whole, (long)turnsRight.whole, (int)rangeMm,
-                   (int)(batteryV * 100.0f + 0.5f), (unsigned)flags);
+  long accel[3] = {0, 0, 0};  // mean since the last packet, mm/s^2
+  if (imuOk) {
+    for (uint8_t i = 0; i < 3; i++) {
+      float lsb = accelCount > 0 ? (float)accelSum[i] / accelCount : (float)accelLast[i];
+      accel[i] = lroundf(lsb * ACCEL_MMS2_PER_LSB);
+    }
+  }
+  char buf[144];
+  int n = snprintf(buf, sizeof(buf), "{O,%u,%lu,%ld,%ld,%ld,%ld,%ld,%d,%d,%u,%ld,%ld,%ld}",
+                   (unsigned)seq, (unsigned long)micros(), (long)odoX.whole, (long)odoY.whole,
+                   (long)odoTh.whole, (long)turnsLeft.whole, (long)turnsRight.whole, (int)rangeMm,
+                   (int)(batteryV * 100.0f + 0.5f), (unsigned)flags, accel[0], accel[1], accel[2]);
   if (n > 0) Serial.write((const uint8_t *)buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1);
   latchedFlags = 0;
+  clearAccel();
   lastReplyUs = micros();
 }
 
@@ -549,10 +602,13 @@ static void handleFrame(const char *s) {
     replyPending = true;  // loop() replies once the duration has passed
   } else if (type == 'R' && n == 2) {
     disableMotors();
+    clearAccel();  // the reply's accelerometer mean covers only the still period below
     if (v[1] != 0) {
       if (!imuOk) imuOk = initImu();  // second chance for a loose I2C cable
       if (!imuOk || !calibrateGyro()) latchedFlags |= FLAG_CALIB_FAILED;
       gyroFailedReads = 0;
+    } else if (imuOk) {
+      sampleAccelAtRest();
     }
     resetOdometry();
     sendObservation(seq);

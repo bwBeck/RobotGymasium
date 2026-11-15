@@ -52,6 +52,26 @@ class RobotCalibration:
     sprocket_diameter: float = 0.043  # effective drive sprocket diameter [m]
     track_width: float = 0.15  # between track centres [m]; only used if the IMU fails
     gyro_sign: int = 1  # -1 if left turns read as negative (see calibrate.py spin)
+    imu_forward: str = "+x"  # MPU6050 axis pointing to the robot's front (calibrate.py imu)
+
+
+STANDARD_GRAVITY = 9.80665
+_IMU_AXES = {"+x": (1.0, 0.0, 0.0), "-x": (-1.0, 0.0, 0.0), "+y": (0.0, 1.0, 0.0), "-y": (0.0, -1.0, 0.0)}
+
+
+def imu_rotation(calibration: RobotCalibration) -> np.ndarray:
+    """3x3 matrix taking MPU6050 axes to robot axes (x forward, y left, z up).
+
+    The chip lies flat: ``imu_forward`` says which of its axes points forward, and the
+    gyro sign says whether its z axis points up (1) or down (-1, chip upside down).
+    """
+    try:
+        forward = np.array(_IMU_AXES[calibration.imu_forward])
+    except KeyError:
+        raise ValueError(f"imu_forward must be one of {sorted(_IMU_AXES)}, "
+                         f"not {calibration.imu_forward!r}") from None
+    up = np.array([0.0, 0.0, 1.0 if calibration.gyro_sign >= 0 else -1.0])
+    return np.array([forward, np.cross(up, forward), up])
 
 
 class RoboGym(gym.Env):
@@ -70,6 +90,9 @@ class RoboGym(gym.Env):
     distance     (1,)       ultrasonic range [m]; max_distance if nothing in range
     dt           (1,)       host time since the last observation [s]
     robot_dt     (1,)       robot-clock time since the robot's last packet [s]
+    accel        (3,)       mean acceleration since the last observation, robot
+                            frame [m/s^2], minus the at-rest reading taken at
+                            reset (so ~0 when still; raw value in info)
     ===========  =========  ====================================================
 
     Action: ``Box(-1, 1, (2,))`` = [left, right] track speed, sign = direction.
@@ -190,6 +213,8 @@ class RoboGym(gym.Env):
         obs_spaces["distance"] = spaces.Box(0.0, self.max_distance, (1,), np.float32)
         obs_spaces["dt"] = spaces.Box(0.0, np.inf, (1,), np.float32)
         obs_spaces["robot_dt"] = spaces.Box(0.0, np.inf, (1,), np.float32)
+        obs_spaces["accel"] = spaces.Box(-np.inf, np.inf, (3,), np.float32)
+        imu_rotation(self.calibration)  # reject a bad imu_forward now, not mid-episode
         self.observation_space = spaces.Dict(obs_spaces)
         self.action_space = spaces.Box(-1.0, 1.0, (2,), np.float32)
 
@@ -207,6 +232,8 @@ class RoboGym(gym.Env):
         self._render_index = -1
         self._render_image: np.ndarray | None = None
         self._window_open = False
+        self._accel_rest: np.ndarray | None = None  # robot-frame reading at the last reset
+        self._accel_v1_warned = False
 
     # ------------------------------------------------------------------ gym API
 
@@ -229,6 +256,8 @@ class RoboGym(gym.Env):
         state = self._request("R", [int(calibrate)], self.timeout + (1.5 if calibrate else 0.0))
         if calibrate and state.calibration_failed:
             logger.warning("gyro calibration failed (robot moving during reset?); kept the old bias")
+        # The R reply averages the accelerometer over the still period: the at-rest reading.
+        self._accel_rest = self._accel_robot(state)
         self._prev_state = None
         self._robot_rebooted = False
         self._low_battery_warned = False
@@ -498,8 +527,15 @@ class RoboGym(gym.Env):
         obs["distance"] = np.array([distance], dtype=np.float32)
         obs["dt"] = np.array([max(dt, 0.0)], dtype=np.float32)
         obs["robot_dt"] = np.array([robot_dt], dtype=np.float32)
+        accel_raw = self._accel_robot(state)
+        if accel_raw is None:
+            obs["accel"] = np.zeros(3, dtype=np.float32)
+        else:
+            rest = self._accel_rest if self._accel_rest is not None else (0.0, 0.0, STANDARD_GRAVITY)
+            obs["accel"] = (accel_raw - rest).astype(np.float32)
 
         info.update(
+            accel_raw=None if accel_raw is None else accel_raw.astype(np.float32),
             pose=np.array([state.x, state.y, state.theta], dtype=np.float32),
             motor_turns_total=np.array([state.turns_left, state.turns_right], dtype=np.float32),
             battery_v=state.battery_v,
@@ -515,6 +551,18 @@ class RoboGym(gym.Env):
         self._prev_t = t_reply
         self._robot_rebooted = False
         return obs, info
+
+    def _accel_robot(self, state: RobotState) -> np.ndarray | None:
+        """The packet's mean accelerometer reading in robot axes (gravity included)."""
+        if state.accel is None:
+            if not self._accel_v1_warned:
+                logger.warning("the robot runs an older RoboGym.ino without accelerometer output - "
+                               "reflash arduino/RoboGym/RoboGym.ino; 'accel' reads 0 until then")
+                self._accel_v1_warned = True
+            return None
+        if not state.imu_ok:
+            return None
+        return imu_rotation(self.calibration) @ np.asarray(state.accel, dtype=np.float64)
 
     def _obs_image(self, frame: Frame | None) -> np.ndarray:
         if frame is not None and frame.index != self._image_index:

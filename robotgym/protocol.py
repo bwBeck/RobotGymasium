@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Union
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2  # v2 added the accelerometer fields to O frames
 HEARTBEAT = "Heartbeat"
 MAX_FRAME_LEN = 256
 
@@ -40,6 +40,9 @@ class RobotState:
     distance: float | None  # ultrasonic range [m]; None = no valid reading
     battery_v: float
     flags: int
+    # Mean accelerometer reading since the previous packet [m/s^2], in the MPU6050's own
+    # axes, gravity included. None from a protocol-v1 sketch (before accelerometer support).
+    accel: tuple[float, float, float] | None = None
 
     @property
     def imu_ok(self) -> bool:
@@ -138,9 +141,9 @@ def parse_frame(content: str) -> Message | None:
     try:
         if head == "O":
             values = [int(v) for v in rest.split(",")]
-            if len(values) != 10:
+            if len(values) not in (10, 13):  # v1 sketches send 10, v2 adds the accelerometer
                 return None
-            seq, t_us, x, y, th, tl, tr, dist, batt, flags = values
+            seq, t_us, x, y, th, tl, tr, dist, batt, flags = values[:10]
             return RobotState(
                 seq=seq,
                 t_us=t_us & 0xFFFFFFFF,
@@ -152,6 +155,7 @@ def parse_frame(content: str) -> Message | None:
                 distance=None if dist < 0 else dist / 1000.0,
                 battery_v=batt / 100.0,
                 flags=flags,
+                accel=tuple(v / 1000.0 for v in values[10:]) if len(values) == 13 else None,
             )
         if head == "H":
             name, _, version = rest.partition(",")
