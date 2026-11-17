@@ -18,6 +18,8 @@ import pytest
 from robotgym import RoboGym, SafetyConfig
 from robotgym.fake_robot import FakeRobotServer, SimRobot
 
+from .conftest import FAST
+
 tk = pytest.importorskip("tkinter")
 
 SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "manual_control.py"
@@ -101,10 +103,10 @@ def root():
 @contextlib.contextmanager
 def _running_app(root, robot=None, **env_kwargs):
     """The app driving a fake robot (default ``SimRobot()``) until the block ends; then
-    checks that closing the window stopped the robot and disconnected."""
+    checks that closing the window stopped the robot and disconnected. Levers map straight
+    to PWM (``FAST``) unless ``env_kwargs`` say otherwise."""
     with FakeRobotServer(robot=robot) as fake:
-        env = RoboGym(**fake.env_kwargs(), render_mode="rgb_array",
-                      reset_settle_time=0.05, calibrate_gyro_on_reset=False, **env_kwargs)
+        env = RoboGym(**{**fake.env_kwargs(), **FAST, "render_mode": "rgb_array", **env_kwargs})
         app = mc.ManualControlApp(root, env, max_speed=0.8, show_plots=False)  # see test_plot_window
         app.start()
         try:
@@ -141,6 +143,17 @@ def _label(lever) -> str:
     return lever.itemcget(lever.value_text, "text")
 
 
+def _lever_value(lever) -> float:
+    """Where the lever's handle is drawn, -1..1."""
+    _, y0, _, y1 = lever.coords(lever.handle)
+    return (lever.mid - (y0 + y1) / 2) / lever.half
+
+
+def _labels(app) -> tuple[str, str]:
+    """The side levers' labels: the PWM the robot got in the latest step."""
+    return _label(app.left_lever), _label(app.right_lever)
+
+
 def test_joystick_drives_the_robot_and_the_window_shows_the_images(root, app_and_robot):
     app, robot = app_and_robot
     assert app._camera_photo.width() == 640  # 320x240 stream, shown 2x
@@ -150,9 +163,10 @@ def test_joystick_drives_the_robot_and_the_window_shows_the_images(root, app_and
 
     start, frames = robot.x, app.camera_frames
     app.joystick.set(0.0, 1.0)  # joystick fully forward
-    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.80", "+0.80")  # they follow
+    assert _lever_value(app.left_lever) == _lever_value(app.right_lever) == pytest.approx(1.0)  # they follow
     # Wait for each effect rather than a fixed time, so a busy machine can't fail the test.
     assert _pump(root, until=lambda: robot.cmd == [204, 204])  # 0.8 * 255
+    assert _pump(root, until=lambda: _labels(app) == ("+204", "+204"))  # what the robot got
     assert _pump(root, until=lambda: robot.x > start + 0.05)
     assert _pump(root, until=lambda: app.camera_frames >= frames + 5)  # the feed follows the motion
     assert _pump(root, until=lambda: "steps/s" in app.readout.get())
@@ -260,7 +274,7 @@ def test_side_levers_drive_one_track_each(root, app_and_robot):
     app, robot = app_and_robot
     app.left_lever.set(0.5)  # left track only
     assert _pump(root, until=lambda: robot.cmd == [102, 0])  # 0.5 * 0.8 * 255
-    assert _label(app.left_lever) == "+0.40" and _label(app.right_lever) == "+0.00"
+    assert _pump(root, until=lambda: _labels(app) == ("+102", "+0"))
     app.left_lever.release()  # let go: only that track stops
     assert _pump(root, until=lambda: robot.cmd == [0, 0])
 
@@ -282,7 +296,7 @@ def test_side_levers_drive_one_track_each(root, app_and_robot):
     app.stop_robot()
     assert _pump(root, until=lambda: robot.cmd == [0, 0])
     assert app.joystick.position == (0.0, 0.0)
-    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+    assert _pump(root, until=lambda: _labels(app) == ("+0", "+0"))
 
 
 def test_safety_latch_goes_red_holds_the_robot_and_clears(root, safe_app_and_robot):
@@ -301,13 +315,13 @@ def test_safety_latch_goes_red_holds_the_robot_and_clears(root, safe_app_and_rob
     assert _pump(root, until=lambda: "SAFETY STOP" in app.readout.get())  # in the flags too
     assert robot.cmd == [0, 0]  # the env stopped the robot itself...
     assert app.joystick.position == (0.0, 0.0)  # ...and the window centred the levers
-    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+    assert _labels(app) == ("+0", "+0")
 
     app.joystick.set(-1.0, 0.0)  # latched: the levers move, but nothing is sent
-    assert (_label(app.left_lever), _label(app.right_lever)) == ("+0.00", "+0.00")
+    assert _labels(app) == ("+0", "+0")
     count = app.steps_shown
     assert _pump(root, until=lambda: app.steps_shown >= count + 3)
-    assert robot.cmd == [0, 0] and latch.latched
+    assert robot.cmd == [0, 0] and latch.latched and _labels(app) == ("+0", "+0")
     app.stop_robot()
 
     latch.button.invoke()  # Clear
@@ -320,7 +334,30 @@ def test_safety_latch_goes_red_holds_the_robot_and_clears(root, safe_app_and_rob
 
     app.joystick.set(0.0, -1.0)  # backing away from the wall is allowed
     assert _pump(root, until=lambda: robot.cmd == [-204, -204])
-    assert (_label(app.left_lever), _label(app.right_lever)) == ("-0.80", "-0.80")
+    assert _pump(root, until=lambda: _labels(app) == ("-204", "-204"))
     app.stop_robot()
     assert _pump(root, until=lambda: robot.cmd == [0, 0])
     assert not latch.latched
+
+
+def test_env_defaults_deadzone_and_smooth_the_levers(root):
+    # The env's own defaults: smoothing 0.5, then smoothed PWM below 120 -> 0.
+    with _running_app(root, pwm_deadzone=120, action_smoothing=0.5) as (app, robot):
+        app.joystick.set(0.0, 1.0)  # from rest, 204 on both tracks: ramps up instead of jumping
+        assert _pump(root, until=lambda: robot.cmd == [204, 204])
+        assert _pump(root, until=lambda: _labels(app) == ("+204", "+204"))
+        sent = [row[1] for row in app.shared.history()]
+        start = sent.index(next(p for p in sent if p != 0))
+        ramp = sent[start:sent.index(204.0)]
+        # 102 (in the deadzone: sent as 0), then 153, 178, 191, ... towards 204
+        assert ramp[:3] == [153.0, 178.0, 191.0] and ramp == sorted(ramp)
+        app.stop_robot()
+        assert _pump(root, until=lambda: robot.cmd == [0, 0])
+
+        app.left_lever.set(0.5)  # 0.5 * 0.8 * 255 = 102: smoothed, it settles inside the deadzone
+        assert _pump(root, until=lambda: "target +102 / +0" in app.readout.get())
+        count = app.steps_shown
+        assert _pump(root, until=lambda: app.steps_shown >= count + 4)
+        assert robot.cmd == [0, 0] and _labels(app) == ("+0", "+0")
+        assert "sent +0 / +0   target +102 / +0" in app.readout.get()  # smoothed, then cut
+        app.stop_robot()

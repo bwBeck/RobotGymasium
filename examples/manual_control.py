@@ -12,6 +12,11 @@ tracks, a side lever its own track. Tick "Hold levers" to make them stay where y
 them, e.g. to drive tank-style with the two side levers. The STOP button or Space always
 stops; Esc, closing the window or Ctrl+C in the terminal stops the robot and quits.
 
+The env turns the levers into PWM like any agent's actions: the robot gets a smoothed
+version of the levers (``--smoothing``), so a lever flicked to full speed ramps up over a
+few steps, and a smoothed PWM below 120 is sent as 0 (``--pwm-deadzone``). The side
+levers' labels show the PWM the robot actually got in the latest step.
+
 The env's safety layer is on (``--no-safety`` turns it off). When it stops the robot (a
 stall, a turn that doesn't happen, an obstacle ahead) the panel under the levers latches
 red with the reason, the levers centre, and the robot stays stopped until you press its
@@ -95,6 +100,7 @@ def format_readout(r: StepResult) -> str:
     ax, ay, az = (float(v) for v in o["accel"])
     x, y, th = (float(v) for v in i["pose"])
     pwm_l, pwm_r = i.get("pwm", (0, 0))
+    target_l, target_r = i.get("pwm_target", (0, 0))
     age = i.get("image_age")
     flags = [name for name, on in (
         ("SAFETY STOP", i.get("safety_trip") is not None),
@@ -114,8 +120,9 @@ def format_readout(r: StepResult) -> str:
         f"dt         {float(o['dt'][0]):.3f} s   robot_dt {float(o['robot_dt'][0]):.3f} s"
         f"   latency {i.get('latency', 0.0):.3f} s",
         f"pose       x {x:+.3f} m   y {y:+.3f} m   theta {th:+.3f} rad   (since reset)",
-        f"action     left {r.action[0]:+.2f}   right {r.action[1]:+.2f}"
-        f"   PWM {pwm_l:+d} / {pwm_r:+d}   {r.rate:.1f} steps/s",
+        f"action     left {r.action[0]:+.2f}   right {r.action[1]:+.2f}   {r.rate:.1f} steps/s",
+        f"PWM        sent {pwm_l:+d} / {pwm_r:+d}   target {target_l:+d} / {target_r:+d}"
+        "   (sent = smoothed target)",
         "flags      " + (", ".join(flags) if flags else "-"),
     ])
 
@@ -347,7 +354,7 @@ class Joystick(tk.Canvas):
 class TrackLever(tk.Canvas):
     """Vertical lever for one track, up = forward: ``on_move(value)`` (-1..1) while
     dragged, ``on_release()`` when let go. It also displays the track's command, whichever
-    lever set it, labelled with the speed actually sent."""
+    lever set it, labelled with the PWM the robot actually got in the latest step."""
 
     SNAP = 0.05  # this close to the middle counts as exactly 0: that track stopped
 
@@ -366,9 +373,9 @@ class TrackLever(tk.Canvas):
         self.bar = self.create_rectangle(cx - 6, self.mid, cx + 6, self.mid, fill="#3aa757", outline="")
         self.create_line(cx - 13, self.mid, cx + 13, self.mid, fill="#5f6b7a")
         self.handle = self.create_rectangle(0, 0, 0, 0, fill=LEVER_IDLE, outline="#1d4f9e", width=2)
-        self.value_text = self.create_text(cx, height - 11, text="+0.00", fill="#3c4650",
+        self.value_text = self.create_text(cx, height - 11, text="+0", fill="#3c4650",
                                            font=("TkFixedFont", 9))
-        self.show(0.0, 0.0)
+        self.show(0.0, 0)
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", lambda _e: self.release())
@@ -382,13 +389,13 @@ class TrackLever(tk.Canvas):
         self.itemconfigure(self.handle, fill=LEVER_IDLE)
         self.on_release()
 
-    def show(self, value: float, sent: float) -> None:
-        """Draws the lever at ``value``, labelled with the speed ``sent`` to the robot."""
+    def show(self, value: float, pwm: int) -> None:
+        """Draws the lever at ``value``, labelled with the ``pwm`` the robot got."""
         cx, y = self.cx, self.mid - value * self.half
         self.coords(self.bar, cx - 6, min(y, self.mid), cx + 6, max(y, self.mid))
         self.itemconfigure(self.bar, fill="#3aa757" if value >= 0 else "#e8833a")
         self.coords(self.handle, cx - 17, y - 7, cx + 17, y + 7)
-        self.itemconfigure(self.value_text, text=f"{sent:+.2f}")
+        self.itemconfigure(self.value_text, text=f"{pwm:+d}")
 
     def _press(self, event) -> None:
         self.itemconfigure(self.handle, fill=LEVER_ACTIVE)
@@ -662,6 +669,7 @@ class ManualControlApp:
         self._camera_photo: tk.PhotoImage | None = None
         self._obs_photo: tk.PhotoImage | None = None
         self._command = (0.0, 0.0)  # [left, right], -1..1: what all three levers show
+        self._received = (0, 0)  # [left, right] PWM the robot got in the latest step
         self._max_speed = max_speed
         self._tick_error: str | None = None
         self._safety_trip: SafetyTrip | None = None  # the latched trip the window has seen
@@ -863,9 +871,8 @@ class ManualControlApp:
         self._draw_track_levers()
 
     def _draw_track_levers(self) -> None:
-        held = self._safety_trip is not None  # latched: the env sends zero whatever the levers say
-        for lever, value in zip((self.left_lever, self.right_lever), self._command):
-            lever.show(value, 0.0 if held else value * self._max_speed)
+        for lever, value, pwm in zip((self.left_lever, self.right_lever), self._command, self._received):
+            lever.show(value, pwm)
 
     def _on_speed(self, value) -> None:
         speed = float(value)
@@ -918,7 +925,6 @@ class ManualControlApp:
                 self.latch.show_armed(self.env.safety.config)
             else:
                 self.latch.show_tripped(trip, clearing)
-            self._draw_track_levers()
 
     def _refresh_camera(self) -> None:
         frame = self.env.render()  # newest full-size frame; safe while the runner steps
@@ -952,6 +958,11 @@ class ManualControlApp:
             self._obs_photo = to_photo(self.root, zoomed)
             self.obs_canvas.itemconfigure(self._obs_item, image=self._obs_photo)
         self.readout.set(format_readout(result))
+        info = result.info
+        # A trip's step drove, but the env stopped the robot right after: it's getting 0 now.
+        tripped = info.get("safety_trip") is not None
+        self._received = (0, 0) if tripped else tuple(info.get("pwm", (0, 0)))  # resets send none
+        self._draw_track_levers()
 
 
 def main() -> None:
@@ -964,6 +975,11 @@ def main() -> None:
                              "small movements drive instead of doing nothing")
     parser.add_argument("--action-duration", type=float, default=0.1,
                         help="seconds per env step before the robot reports back (default 0.1)")
+    parser.add_argument("--pwm-deadzone", type=int, default=None,
+                        help="smoothed track PWM below this is sent as 0 (env default 120; 0 = off)")
+    parser.add_argument("--smoothing", type=float, default=None,
+                        help="action smoothing, 0 <= x < 1: weight of the previous PWM each step "
+                             "(env default 0.5; 0 = off)")
     parser.add_argument("--no-safety", action="store_true",
                         help="drive without the env's safety layer (stall / no-turn / obstacle stop)")
     parser.add_argument("--no-plots", action="store_true",
@@ -980,6 +996,10 @@ def main() -> None:
     max_speed = min(max(args.max_speed, 0.1), 1.0)
     env_kwargs = {"render_mode": "rgb_array", "action_duration": args.action_duration,
                   "min_pwm": args.min_pwm, "safety": None if args.no_safety else SafetyConfig()}
+    if args.pwm_deadzone is not None:
+        env_kwargs["pwm_deadzone"] = args.pwm_deadzone
+    if args.smoothing is not None:
+        env_kwargs["action_smoothing"] = args.smoothing
     app_kwargs = {"max_speed": max_speed, "show_plots": not args.no_plots,
                   "plot_seconds": max(args.plot_seconds, 1.0)}
     with contextlib.ExitStack() as stack:

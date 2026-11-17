@@ -204,3 +204,37 @@ def test_normal_driving_does_not_trip(robot_env):
     for action in plan:
         _, _, _, _, info = env.step(action)
         assert info["safety_trip"] is None, (action, info["safety_trip"])
+
+
+def test_safety_judges_the_pwm_the_robot_gets_not_the_action():
+    # 0.05 m from the wall, facing it. Deadzone 120 and smoothing 0.5, as the env defaults.
+    with FakeRobotServer(robot=SimRobot(start=(2.86, 1.5, 0.0))) as fake:
+        env = RoboGym(**{**fake.env_kwargs(), **FAST, "camera": "none", "safety": SafetyConfig(),
+                         "pwm_deadzone": 120, "action_smoothing": 0.5})
+        try:
+            env.reset()
+            seen = []  # every PWM pair the safety layer was asked about
+            command, check = env.safety.command, env.safety.check
+            env.safety.command = lambda pwm, distance: seen.append(("command", pwm)) or command(pwm, distance)
+            env.safety.check = lambda prev, pwm, obs, info: seen.append(("check", prev, pwm)) or check(
+                prev, pwm, obs, info)
+
+            # Forward into the wall, but the smoothed PWM (76, then 115) is still in the
+            # deadzone: the robot gets nothing, so there's nothing to refuse yet.
+            for _ in range(2):
+                _, _, _, _, info = env.step([0.6, 0.6])
+                assert info["pwm"] == (0, 0) and info["pwm_target"] == (153, 153)
+                assert info["safety_trip"] is None
+            assert seen == [("command", (0, 0)), ("check", (0, 0), (0, 0))] * 2
+            # Smoothed 134: now the robot would drive forward into the wall. Refused.
+            _, _, _, _, info = env.step([0.6, 0.6])
+            assert seen[-2:] == [("command", (134, 134)), ("check", (0, 0), (0, 0))]  # 0 was sent
+            assert info["pwm"] == (0, 0) and "refused" in info["safety_trip"].message
+            assert fake.robot.cmd == [0, 0]
+
+            env.safety.clear()  # the smoothing restarted at the trip: backing off ramps from rest
+            _, _, _, _, info = env.step([-1.0, -1.0])
+            assert info["pwm"] == (-128, -128) and info["safety_trip"] is None
+            assert seen[-2:] == [("command", (-128, -128)), ("check", (0, 0), (-128, -128))]
+        finally:
+            env.close()

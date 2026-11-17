@@ -96,7 +96,18 @@ class RoboGym(gym.Env):
                             reset (so ~0 when still; raw value in info)
     ===========  =========  ====================================================
 
-    Action: ``Box(-1, 1, (2,))`` = [left, right] track speed, sign = direction.
+    Action: ``Box(-1, 1, (2,))`` = [left, right] track speed, sign = direction. Each step
+    turns it into the PWM the robot gets, per track:
+
+    1. scale to PWM (``min_pwm``..``max_pwm``);
+    2. smooth: ``s = action_smoothing * s + (1 - action_smoothing) * pwm``, so the robot
+       gets a smoothed version of the actions (``s`` restarts from 0 after a reset, a
+       safety stop, or a pause long enough for the robot's hold timeout to stop it);
+    3. round ``s``; below ``pwm_deadzone`` (120) -> 0. Only the smoothed PWM goes through
+       the deadzone, so the robot never gets a PWM between 0 and it, also while ramping;
+    4. the safety layer, if on, judges this PWM and may replace it with 0.
+
+    ``info["pwm"]`` is the PWM the robot received, ``info["pwm_target"]`` the result of 1.
 
     Reward and termination depend on the task: pass ``reward_fn(obs, action, info)``
     and ``terminated_fn(obs, info)`` (defaults: 0.0 and never). Bound episodes with
@@ -131,6 +142,8 @@ class RoboGym(gym.Env):
         action_duration: float = 0.1,
         max_pwm: int = 255,
         min_pwm: int = 0,
+        pwm_deadzone: int = 120,
+        action_smoothing: float = 0.5,
         hold_timeout: float = 0.5,
         max_distance: float = 4.0,
         reset_settle_time: float = 0.5,
@@ -162,6 +175,12 @@ class RoboGym(gym.Env):
             max_pwm: PWM for an action of +-1.
             min_pwm: PWM for the smallest non-zero action - set it near the motor
                 deadband so small actions still move the robot (0 = linear mapping).
+            pwm_deadzone: a smoothed track PWM whose magnitude is below this is sent as 0
+                (0 = off). It applies after the smoothing, not to the action itself. Unlike
+                ``min_pwm`` it doesn't remap: an action that settles below it stops that track.
+            action_smoothing: weight of the previous smoothed PWM in each step's
+                exponential average, 0 <= x < 1 (0 = off). At 0.5 a step change in the
+                action reaches the robot as 50 %, 75 %, 88 %, ... of it, one step each.
             hold_timeout: the robot stops if no command arrives within this many
                 seconds after it replied (safety net if the PC hangs or disconnects).
             max_distance: clip / no-echo value for the distance observation [m].
@@ -187,6 +206,10 @@ class RoboGym(gym.Env):
             raise ValueError("action_duration must be between 0 and 10 s")
         if not 0 <= min_pwm <= max_pwm <= 255:
             raise ValueError("need 0 <= min_pwm <= max_pwm <= 255")
+        if not 0 <= pwm_deadzone <= 255:
+            raise ValueError("pwm_deadzone must be between 0 and 255")
+        if not 0.0 <= action_smoothing < 1.0:
+            raise ValueError("action_smoothing must be >= 0 and < 1 (1 would never move)")
         if not 0.05 <= hold_timeout <= 60.0:
             raise ValueError("hold_timeout must be between 0.05 and 60 s")
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
@@ -204,6 +227,8 @@ class RoboGym(gym.Env):
         self.action_duration = float(action_duration)
         self.max_pwm = int(max_pwm)
         self.min_pwm = int(min_pwm)
+        self.pwm_deadzone = int(pwm_deadzone)
+        self.action_smoothing = float(action_smoothing)
         self.hold_timeout = float(hold_timeout)
         self.max_distance = float(max_distance)
         self.reset_settle_time = float(reset_settle_time)
@@ -247,6 +272,7 @@ class RoboGym(gym.Env):
         self._accel_rest: np.ndarray | None = None  # robot-frame reading at the last reset
         self._accel_v1_warned = False
         self._last_pwm = (0, 0)  # what the robot is running now: the safety checks' baseline
+        self._smoothed = np.zeros(2)  # the smoothed [left, right] PWM, before the output deadzone
 
     # ------------------------------------------------------------------ gym API
 
@@ -262,6 +288,7 @@ class RoboGym(gym.Env):
         self.connect()
         self._request("A", [0, 0, 0], self.timeout)
         self._last_pwm = (0, 0)
+        self._smoothed[:] = 0.0
         settle = float(options.get("settle_time", self.reset_settle_time))
         if settle > 0:
             time.sleep(settle)
@@ -290,10 +317,13 @@ class RoboGym(gym.Env):
         if a.shape != (2,) or not np.all(np.isfinite(a)):
             raise ValueError(f"action must be two finite numbers, got {action!r}")
         a = np.clip(a, -1.0, 1.0)
-        left, right = self._action_to_pwm(a)
-        if self.safety is not None:  # zero while latched; forward refused near an obstacle
-            last = self._last_state
+        target = self._action_to_pwm(a)  # the deadzone comes after the smoothing, in _smooth
+        left, right = self._smooth(target)
+        if self.safety is not None:  # judges what the robot would get: zero while latched,
+            last = self._last_state  # forward refused near an obstacle
             left, right = self.safety.command((left, right), last.distance if last is not None else None)
+            if self.safety.tripped:
+                self._smoothed[:] = 0.0  # nothing moves: once cleared, ramp up from rest
 
         t_sent = time.monotonic()
         duration_ms = round(self.action_duration * 1000)
@@ -302,12 +332,14 @@ class RoboGym(gym.Env):
         t_reply = time.monotonic()
         obs, info = self._observe(state, t_reply, image_newer_than=t_sent + self.action_duration)
         info["pwm"] = (left, right)
+        info["pwm_target"] = target
         info["latency"] = max(0.0, t_reply - t_sent - self.action_duration)
         if self.safety is not None:
             if self.safety.check(prev_pwm, (left, right), obs, info) is not None:
                 # Stop now: the robot would keep running this step's action until the next command.
                 self._request("A", [0, 0, 0], self.timeout)
                 self._last_pwm = (0, 0)
+                self._smoothed[:] = 0.0
             info["safety_trip"] = self.safety.trip
 
         reward = float(self.reward_fn(obs, a, info)) if self.reward_fn else 0.0
@@ -397,6 +429,18 @@ class RoboGym(gym.Env):
         pwm = np.where(mag > 0, self.min_pwm + mag * (self.max_pwm - self.min_pwm), 0.0)
         pwm = np.sign(a) * pwm
         return int(round(float(pwm[0]))), int(round(float(pwm[1])))
+
+    def _deadzone(self, pwm) -> tuple[int, int]:
+        """Each track's PWM, or 0 where its magnitude is below ``pwm_deadzone``."""
+        return tuple(0 if abs(p) < self.pwm_deadzone else int(p) for p in pwm)
+
+    def _smooth(self, target: tuple[int, int]) -> tuple[int, int]:
+        """Advances the exponential average towards ``target``; returns the PWM to send."""
+        if self._prev_state is not None and time.monotonic() - self._prev_t > self.hold_timeout:
+            self._smoothed[:] = 0.0  # the robot's hold timeout stopped it meanwhile
+        k = self.action_smoothing
+        self._smoothed = k * self._smoothed + (1.0 - k) * np.asarray(target, dtype=float)
+        return self._deadzone(int(v) for v in np.round(self._smoothed))
 
     def _config_fields(self) -> list[int]:
         c = self.calibration

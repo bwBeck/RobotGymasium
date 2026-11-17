@@ -3,8 +3,11 @@ import pytest
 from robotgym import RoboGym
 from robotgym.fake_robot import FakeRobotServer
 
-# Keep resets quick in tests: short settle, no gyro calibration pause.
-FAST = {"reset_settle_time": 0.05, "calibrate_gyro_on_reset": False}
+# Actions map straight to PWM (no deadzone, no smoothing), so tests can predict the PWM
+# and the motion; tests of those two features turn them on themselves.
+DIRECT = {"pwm_deadzone": 0, "action_smoothing": 0.0}
+# Test defaults: DIRECT, and quick resets (short settle, no gyro calibration pause).
+FAST = {"reset_settle_time": 0.05, "calibrate_gyro_on_reset": False, **DIRECT}
 
 
 @pytest.fixture

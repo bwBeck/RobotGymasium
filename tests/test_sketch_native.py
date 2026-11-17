@@ -19,6 +19,8 @@ from robotgym import RoboGym
 from robotgym.link import ProtocolError, RobotLink, TcpTransport
 from robotgym.fake_robot import FakeEsp32Bridge
 
+from .conftest import DIRECT
+
 ROOT = Path(__file__).resolve().parents[1]
 SKETCH = ROOT / "arduino" / "RoboGym" / "RoboGym.ino"
 NATIVE = ROOT / "tests" / "native"
@@ -87,7 +89,7 @@ def robot(native_sketch):
 @pytest.fixture
 def env(robot):
     env = RoboGym(host="127.0.0.1", control_port=robot.port, camera="none",
-                  reset_settle_time=0.05, action_duration=0.3)
+                  reset_settle_time=0.05, action_duration=0.3, **DIRECT)
     yield env
     env.close()
 
@@ -129,7 +131,7 @@ def test_sketch_timestamps_survive_the_micros_wraparound(env):
 
 def test_sketch_watchdog_stops_the_motors(robot):
     env = RoboGym(host="127.0.0.1", control_port=robot.port, camera="none",
-                  reset_settle_time=0.05, action_duration=0.05, hold_timeout=0.2)
+                  reset_settle_time=0.05, action_duration=0.05, hold_timeout=0.2, **DIRECT)
     try:
         env.reset()
         env.step([0.6, 0.6])

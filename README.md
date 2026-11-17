@@ -64,7 +64,24 @@ About `accel`:
   `calibrate.py imu` (see Calibration below).
 
 **Action:** `Box(-1, 1, shape=(2,))` = `[left, right]` track speed. The sign is the
-direction, and ±1 is full PWM (`max_pwm`).
+direction, and ±1 is full PWM (`max_pwm`). Each step turns the action into the PWM the
+robot gets, per track:
+
+1. **Scale** to PWM (`min_pwm`…`max_pwm`).
+2. **Smoothing:** the robot gets an exponential average of the actions,
+   `s = action_smoothing·s + (1 − action_smoothing)·pwm` (0.5 by default). A jump from 0
+   to full speed reaches the robot as 128, 191, 223, … over successive steps. `s` restarts
+   from 0 after `reset()`, after a safety stop, and after a pause long enough for the
+   robot's hold timeout to stop it.
+3. **Deadzone**, on the smoothed PWM only: below `pwm_deadzone` (120) in magnitude it becomes
+   0, so the robot never gets a PWM between 0 and 120, not even while ramping. It doesn't
+   remap: an action of 0.4 (PWM 102) never gets the track going, 0.5 (PWM 128) does. Slowing
+   from 200 to 100 passes through 150 and 125 before the track stops. Stopping is quick
+   too: from below about PWM 240, the first step after a stop already sends 0.
+4. **Safety layer**, if on: it judges this PWM, the one the robot would really get, and may
+   replace it with 0.
+
+`pwm_deadzone=0, action_smoothing=0` gives the plain linear mapping.
 
 **Reward / termination** depend on the task you're training, so you supply them:
 `RoboGym(reward_fn=lambda obs, action, info: ..., terminated_fn=lambda obs, info: ...)`.
@@ -73,12 +90,14 @@ The defaults are a reward of 0.0 and never terminating. Limit episode length wit
 
 `info` also carries the cumulative odometry since `reset()` (`pose`,
 `motor_turns_total`), `accel_raw`, `battery_v`, `imu_ok`, `watchdog_stopped`,
-`robot_rebooted`, `latency`, `image_age`, the PWM actually sent (`pwm`), and with the
-safety layer on, `safety_trip`.
+`robot_rebooted`, `latency`, `image_age`, the PWM the robot actually received (`pwm`),
+the action's PWM before smoothing and the deadzone (`pwm_target`), and with the safety
+layer on, `safety_trip`.
 
 ### What one step does
 
-1. `step(a)` sends `{A,seq,left,right,duration}` to the robot.
+1. `step(a)` turns `a` into PWM (smoothing, deadzone, safety: see above) and sends
+   `{A,seq,left,right,duration}` to the robot.
 2. The robot applies the speeds, waits `action_duration` (0.1 s by default), then sends
    its sensor packet.
 3. The env takes the newest camera frame that arrived after the action finished,
@@ -107,7 +126,10 @@ A trip **latches**. The env stops the robot at once, then every step sends zero 
 `SafetyTrip` (`.trigger`, `.message`), or `None` while armed. To end episodes on a trip, pass
 `terminated_fn=lambda obs, info: info["safety_trip"] is not None`.
 
-The checks run once per step on the PC, so they react a step late (~0.2 s). They add to the
+The checks judge the PWM the robot actually receives (after the smoothing and deadzone), not
+the action passed to `step()`. Smoothing spreads a speed change over several steps, so the
+`stall` check, which needs a change of more than 50 in one step, sees fewer of them. The
+checks run once per step on the PC, so they react a step late (~0.2 s). They add to the
 robot's own hold-timeout stop; they don't replace it. The thresholds are fields of
 `SafetyConfig`. Tune `min_accel` and `min_yaw_rate` for your robot with the manual-control
 plots: *accel x vs ΔPWM* and *yaw rate vs PWM L−R* show what it really does.
@@ -185,7 +207,9 @@ keep it still for ~2 seconds after switching it on.
   **Let go of a lever and it springs back, which stops the robot.** The joystick stops
   both tracks; a side lever stops only its own track. Tick *Hold levers* to make them stay
   where you leave them. For tank-style driving, set the left lever, then the right one.
-  *Max speed* scales all three; the side levers' labels show the speed actually sent.
+  *Max speed* scales all three. The levers go through the env's smoothing and deadzone like
+  any agent's actions, and the side levers' labels show the PWM the robot actually got in the
+  latest step. The readout shows that next to the target PWM, so you can watch the ramp.
 * **STOP** or **Space** always stops. *Reset odometry* calls `env.reset()`, and **Esc**
   or closing the window stops the robot and disconnects.
 * **The safety layer is on.** The panel under the levers says *Safety armed* while all is
@@ -214,7 +238,8 @@ keep it still for ~2 seconds after switching it on.
 The env runs in a background thread and steps it as fast as the robot answers (~5 Hz),
 so the window never waits for the robot. If the window freezes, that thread sends
 zero speed. Options: `--fake`, `--max-speed 0.6`, `--min-pwm 40` (small lever movements
-drive instead of sitting in the motor deadband), `--action-duration`, `--no-safety`. It needs
+drive instead of sitting in the motor deadband), `--action-duration`, `--pwm-deadzone 120`,
+`--smoothing 0.5` (0 turns either off), `--no-safety`. It needs
 tkinter, which ships with Python. On Debian/Ubuntu: `sudo apt install python3-tk`.
 
 ## Calibration
@@ -250,6 +275,8 @@ improves `motor_turns`.
 | `image_shape` | (120, 160) | observation image size (height, width) |
 | `camera_framesize` | 4 | ESP32 resolution index: 4 = 320×240 on ELEGOO's firmware; `None` leaves it alone |
 | `min_pwm` | 0 | PWM for the smallest non-zero action. Set it near the deadband so small actions still move the robot |
+| `pwm_deadzone` | 120 | smoothed track PWM below this is sent as 0 (0 = off) |
+| `action_smoothing` | 0.5 | weight of the previous PWM in the per-step exponential average, 0 ≤ x < 1 (0 = off) |
 | `reset_settle_time` | 0.5 | pause after stopping in `reset()` before zeroing |
 | `calibrate_gyro_on_reset` | True | re-measure the gyro bias each reset (~0.5 s, robot must be still) |
 | `safety` | None | `SafetyConfig()` turns on the safety layer (see above) |

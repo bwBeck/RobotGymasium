@@ -232,6 +232,54 @@ def test_action_mapping_with_min_pwm_and_clipping(make_env):
     assert env.step(np.array([2.0, -3.0]))[4]["pwm"] == (200, -200)
 
 
+def test_pwm_deadzone_stops_tracks_below_it(fake, make_env):
+    env = make_env(camera="none", pwm_deadzone=120, action_duration=0.0)  # no smoothing
+    env.reset()
+    _, _, _, _, info = env.step([0.4, -0.4])  # +-102: both inside the deadzone
+    assert info["pwm"] == (0, 0) and fake.robot.cmd == [0, 0]
+    assert info["pwm_target"] == (102, -102)  # the action itself isn't cut
+    _, _, _, _, info = env.step([0.47, -0.5])  # 120 is not below 120; -128 is outside
+    assert info["pwm"] == (120, -128) and fake.robot.cmd == [120, -128]
+    assert env.step([0.46, 1.0])[4]["pwm"] == (0, 255)  # 117 -> 0, one track at a time
+
+
+def test_action_smoothing_ramps_the_pwm(fake, make_env):
+    env = make_env(camera="none", action_smoothing=0.5, action_duration=0.0)
+    env.reset()
+    sent = []
+    for action in [[1.0, 1.0]] * 3 + [[0.0, -1.0]] * 2:
+        _, _, _, _, info = env.step(action)
+        sent.append(info["pwm"])
+        assert fake.robot.cmd == list(info["pwm"])  # what the robot got
+    assert info["pwm_target"] == (0, -255)  # the action's PWM, before smoothing
+    # 255 * (1/2, 3/4, 7/8), then each track halves its way to the new target.
+    assert sent == [(128, 128), (191, 191), (223, 223), (112, -16), (56, -135)]
+    env.reset()  # the robot is stopped: start again from 0
+    assert env.step([1.0, 1.0])[4]["pwm"] == (128, 128)
+
+
+def test_deadzone_comes_after_the_smoothing(make_env):
+    env = make_env(camera="none", action_smoothing=0.5, pwm_deadzone=120, action_duration=0.0)
+    env.reset()
+    plan = [[0.8, 0.8]] * 3 + [[0.4, 0.4]] * 3 + [[0.0, 0.0]]
+    steps = [env.step(action)[4] for action in plan]
+    # Towards 204: smoothed 102 (-> 0), 153, 178.5. Then towards 102, which is inside the
+    # deadzone but is smoothed first: 140, 121, then 111.6 (-> 0). Cutting the action
+    # before smoothing would have dropped straight to 0 instead. Stopping: 55.8 -> 0.
+    assert [info["pwm"][0] for info in steps] == [0, 153, 178, 140, 121, 0, 0]
+    assert [info["pwm_target"][0] for info in steps] == [204] * 3 + [102] * 3 + [0]
+
+
+def test_smoothing_restarts_once_the_robot_stopped_itself(fake, make_env):
+    env = make_env(camera="none", action_smoothing=0.5, hold_timeout=0.2, action_duration=0.0)
+    env.reset()
+    env.step([1.0, 1.0])
+    assert env.step([1.0, 1.0])[4]["pwm"] == (191, 191)
+    time.sleep(0.5)  # the agent pauses: the robot's hold timeout stops it
+    assert fake.robot.cmd == [0, 0]
+    assert env.step([1.0, 1.0])[4]["pwm"] == (128, 128)  # ramps up from rest, no jump to 223
+
+
 def test_invalid_use_is_rejected(make_env):
     env = make_env(camera="none")
     with pytest.raises(gym.error.ResetNeeded):
@@ -243,6 +291,10 @@ def test_invalid_use_is_rejected(make_env):
         env.step([float("nan"), 0.0])
     with pytest.raises(ValueError):
         RoboGym(camera="webcam")
+    with pytest.raises(ValueError):
+        RoboGym(action_smoothing=1.0)  # would never move
+    with pytest.raises(ValueError):
+        RoboGym(pwm_deadzone=300)
 
 
 def test_reward_and_termination_hooks(make_env):
