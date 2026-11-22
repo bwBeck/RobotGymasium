@@ -23,7 +23,9 @@
                       first-order lag). Its constants are sent by the PC (C frame), so
                       calibration never needs a re-flash.
     * position        dead reckoning: estimated track speed + gyro heading.
-    * distance        HC-SR04 ultrasonic, interrupt driven (never blocks the loop).
+    * distance        HC-SR04 ultrasonic, interrupt driven (never blocks the loop). Reported
+                      as -1 (no reading) when the sensor doesn't answer or its echo line
+                      stays high, never as a stale value.
     * time            micros() timestamp of every packet; the PC differences them.
 
   The robot sends cumulative values since the last reset (R frame). The PC computes the
@@ -160,6 +162,8 @@ const uint32_t TICK_US = 4000;              // 250 Hz model / gyro integration
 const uint32_t PING_PERIOD_US = 60000;      // HC-SR04 wants >= 60 ms between pings
 const uint32_t ECHO_RISE_TIMEOUT_US = 30000;
 const uint32_t ECHO_MAX_US = 23500;         // ~4 m round trip
+const uint8_t ECHO_STUCK_PINGS = 5;         // echo still high at 5 ping times in a row (300 ms):
+                                            // longer than any clone's no-echo pulse
 const int16_t RANGE_MAX_MM = 4000;
 const float MM_PER_ECHO_US = 0.1715f;       // speed of sound / 2 at ~20 C
 const uint32_t BATTERY_PERIOD_US = 50000;
@@ -227,6 +231,7 @@ float heading = 0.0f;  // wrapped to [-pi, pi], used for the x/y projection
 volatile uint8_t echoState = ECHO_IDLE;
 volatile uint32_t echoRiseUs = 0, echoFallUs = 0;
 uint32_t pingStartUs = 0;
+uint8_t echoHighPings = 0;  // ping times in a row the echo line was already high
 int16_t rangeMm = -1;
 bool rangeNoEcho = false;
 
@@ -427,7 +432,9 @@ ISR(PCINT0_vect) {
 static void initUltrasonic() {
   pinMode(PIN_TRIG, OUTPUT);
   digitalWrite(PIN_TRIG, LOW);
-  pinMode(PIN_ECHO, INPUT);
+  // Pulled up: an echo pulse with a weak high level (a worn contact in the echo or 5 V line)
+  // still reads high, and an open echo wire reads high instead of noise (-> no reading).
+  pinMode(PIN_ECHO, INPUT_PULLUP);
   PCICR |= _BV(PCIE0);    // pin-change interrupts for D8..D13
   PCMSK0 |= _BV(PCINT4);  // ...but only D12 (echo)
 }
@@ -451,7 +458,15 @@ static void serviceUltrasonic(uint32_t now) {
     echoState = ECHO_IDLE;
   } else if (state == ECHO_IDLE && elapsed(now, pingStartUs, PING_PERIOD_US)) {
     pingStartUs = now;
-    if (digitalRead(PIN_ECHO) == HIGH) return;  // still busy from the last ping: next period
+    if (digitalRead(PIN_ECHO) == HIGH) {  // still busy from the last ping: next period...
+      if (echoHighPings < ECHO_STUCK_PINGS) echoHighPings++;
+      if (echoHighPings >= ECHO_STUCK_PINGS) {
+        rangeMm = -1;  // ...but not this long: stuck or open line. No reading, not a stale one
+        rangeNoEcho = false;
+      }
+      return;
+    }
+    echoHighPings = 0;
     echoState = ECHO_WAIT_RISE;
     digitalWrite(PIN_TRIG, HIGH);
     delayMicroseconds(10);

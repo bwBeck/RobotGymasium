@@ -6,6 +6,8 @@
 // reads +1 g up plus fixed offsets and pushes forward while both tracks drive forward,
 // the ultrasonic sensor echoes an obstacle 1.000 m away and the battery reads 7.90 V.
 // micros() starts 3 s before its 32-bit wrap so wrap handling is exercised in every run.
+// With ROBOGYM_SIM_ECHO_STUCK_AFTER_S=<s> set, the echo line sticks high from then on, like a
+// locked-up sensor or an open echo wire behind the pull-up.
 #include <Arduino.h>
 #include <Wire.h>
 #include <fcntl.h>
@@ -49,6 +51,7 @@ void delayMicroseconds(unsigned int us) { usleep(us); }
 
 // ---- ultrasonic: echo pulse scheduled on the trigger's falling edge ----
 static double echoRiseAt = -1, echoFallAt = -1;
+static double echoStuckAt = -1;  // us; -1 = never
 
 static void setEcho(uint8_t level) {
   pinState[12] = level;
@@ -148,8 +151,14 @@ int main() {
   fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
   setvbuf(stdout, NULL, _IONBF, 0);
   setup();
+  const char *stuck = getenv("ROBOGYM_SIM_ECHO_STUCK_AFTER_S");
+  if (stuck != NULL) echoStuckAt = atof(stuck) * 1e6;
   while (!stdinEof) {
     double t = nowUs();
+    if (echoStuckAt >= 0 && t >= echoStuckAt) {
+      echoRiseAt = echoFallAt = -1;  // no more pulses: the line just stays high
+      if (pinState[12] != HIGH) setEcho(HIGH);
+    }
     if (echoRiseAt >= 0 && t >= echoRiseAt) {
       echoRiseAt = -1;
       setEcho(HIGH);

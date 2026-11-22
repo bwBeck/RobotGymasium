@@ -7,6 +7,7 @@ ahead, a 7.90 V battery, a gyro driven by the track commands, and a micros() cou
 that wraps a few seconds into every run.
 """
 
+import os
 import shutil
 import subprocess
 import threading
@@ -43,8 +44,9 @@ def native_sketch(tmp_path_factory):
 class ProcessDevice:
     """The compiled sketch as a serial device: its stdin/stdout are the UNO's UART."""
 
-    def __init__(self, exe):
-        self.proc = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    def __init__(self, exe, env=None):
+        self.proc = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+                                     env=None if env is None else {**os.environ, **env})
         self._buf = bytearray()
         self._lock = threading.Lock()
         threading.Thread(target=self._pump, daemon=True).start()
@@ -154,3 +156,24 @@ def test_sketch_rejects_malformed_commands(robot):
         assert link.request("P", [], 2.0).imu_ok
     finally:
         link.close()
+
+
+def test_sketch_reports_no_reading_once_the_echo_line_sticks_high(native_sketch):
+    # A locked-up sensor or an open echo wire (read high through the pull-up): the sketch
+    # must say "no reading", not keep sending the last distance it measured.
+    device = ProcessDevice(native_sketch, env={"ROBOGYM_SIM_ECHO_STUCK_AFTER_S": "2.5"})
+    bridge = FakeEsp32Bridge(device)
+    bridge.start()
+    env = RoboGym(host="127.0.0.1", control_port=bridge.port, camera="none",
+                  reset_settle_time=0.05, action_duration=0.3, **DIRECT)
+    try:
+        obs, info = env.reset()  # connects within the first ~2 s, before the line sticks
+        assert info["distance_valid"] and obs["distance"][0] == pytest.approx(1.0, abs=0.03)
+        time.sleep(3.0)
+        obs, _, _, _, info = env.step([0.0, 0.0])
+        assert not info["distance_valid"]
+        assert obs["distance"][0] == pytest.approx(env.max_distance)  # the env's no-reading value
+    finally:
+        env.close()
+        bridge.stop()
+        device.close()

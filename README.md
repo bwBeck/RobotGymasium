@@ -315,7 +315,7 @@ ESP32 drops the connection after ~4 s. When the PC disconnects, the ESP32 sends
 
 ## Tests
 
-`pytest` runs five layers:
+`pytest` runs six layers:
 
 * `tests/test_protocol.py`: frame parsing and pose math.
 * `tests/test_env.py`: the full env against the fake robot. Covers spaces, motion signs,
@@ -326,6 +326,9 @@ ESP32 drops the connection after ~4 s. When the PC disconnects, the ESP32 sends
 * `tests/test_sketch_native.py`: compiles **the real `RoboGym.ino`** for your PC against
   small Arduino stand-ins (`tests/native/`) and drives it with the env. Includes a
   simulated `micros()` wraparound. Needs `g++`; skipped otherwise.
+* `tests/test_ultrasonic_sketch.py`: compiles `UltrasonicTest.ino` the same way and runs it
+  against a fake HC-SR04 with each fault (trigger or echo wire open, flapping contact, stuck
+  sensor, nothing in range), checking it names the right one. Needs `g++`.
 * `tests/test_manual_control.py`: the manual-control window driving the fake robot,
   with the window hidden. Skipped where Tk has no display.
 
@@ -345,4 +348,36 @@ received the commands. It then names the broken part.
 | tracks run the wrong way | set `INVERT_LEFT_MOTOR` / `INVERT_RIGHT_MOTOR` in the sketch, or check `MOTOR_DRIVER` |
 | `dθ` has the wrong sign | `calibrate.py spin`, then `RobotCalibration(gyro_sign=-1)` |
 | `robot_rebooted` in `info` | battery brown-out when the motors start: charge the battery |
+| `no distance reading` flag | the ultrasonic sensor isn't answering. Re-flash `RoboGym.ino` if it's older than 2026-11-22 (echo pull-up), else run the test sketch below |
 | new features missing, or errors about keys like `accel` | `robotgym` was installed as a copy (`pip install .`): reinstall with `pip install -e .` so it follows the repo |
+
+### Ultrasonic test sketch
+
+`arduino/UltrasonicTest/UltrasonicTest.ino` tests the HC-SR04 and its wiring on their own.
+Flash it in place of `RoboGym.ino` (switch on "Upload"), keep the USB cable in, and open the
+Serial Monitor at **115200 baud**. It pings 10 times a second, prints each result, and every
+2 s adds a summary with a verdict. The motors stay off.
+
+Point the sensor at a wall 0.3–2 m away, then wiggle the cable and press on each plug and
+header one spot at a time. Failures that follow your hand mark the bad contact. Send:
+
+* `s` to sweep the head 60–120° while pinging, which bends the cable the way driving does;
+* `p` to switch the echo pin's pull-up off and on. If pings only succeed with it on, the
+  echo pulse's high level is weak, usually a worn contact in the echo or 5 V line.
+  `RoboGym.ino` uses the pull-up too (since 2026-11-22), so such a sensor still reads;
+* `f` to ping every 60 ms, as `RoboGym.ino` does, instead of 100 ms;
+* `r` to reset the counters.
+
+| result | meaning |
+|---|---|
+| `OK` | a range of 2 cm – 4 m |
+| `NO ANSWER` | echo idles low, so the sensor has power and the echo wire is fine, but it ignores the trigger: **trigger wire** open, or the sensor is dead |
+| `ECHO HIGH` | nothing holds echo low: **echo wire or the sensor's 5 V / GND wire** open, or the sensor locked up |
+| `NO ECHO` | the sensor works but heard nothing within 4 m: not a wiring fault |
+| `STUCK HIGH` | echo went high and stayed high: the sensor locked up (power-cycle), or echo is shorted to 5 V |
+| `GLITCH` | a pulse under 2 cm: noise, usually a bouncing contact |
+
+`NO ANSWER` and `ECHO HIGH` are what the env reports as `no distance reading`. A mix of `OK`
+with either of them, or with `GLITCH`, is a contact that keeps making and breaking. The
+summary says which line it is. Re-flash `RoboGym.ino` and set the switch back to "Cam"
+when done.
