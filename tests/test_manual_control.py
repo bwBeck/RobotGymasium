@@ -233,12 +233,14 @@ def test_plot_window(root, app_and_robot):
                 and points(plots.accel_plot) == 3 * rows  # x, y, z per step
                 and all(points(p) == 2 * rows for p in plots.scatters)  # left + right vs each axis
                 # ΔPWM needs a previous step: every step but the first
-                and all(points(p) == 2 * (rows - 1) for p in plots.change_scatters)
+                and points(plots.change_scatters[0]) == rows - 1  # forward change vs accel x
+                and all(points(p) == 2 * (rows - 1) for p in plots.change_scatters[1:])
                 and points(plots.turn_scatter) == rows  # yaw vs left - right
                 and points(plots.turn_change_scatter) == rows - 1  # their changes
                 and f"{rows} steps" in plots.info.get())
 
     assert _pump(root, until=plots_match_history)
+    assert not plots.change_scatters[0].find_withtag("zone")  # no safety layer: no trip zone
 
     app.clear_history()  # the Clear button
     _pump(root, seconds=0.2)
@@ -361,3 +363,34 @@ def test_env_defaults_deadzone_and_smooth_the_levers(root):
         assert robot.cmd == [0, 0] and _labels(app) == ("+0", "+0")
         assert "sent +0 / +0   target +102 / +0" in app.readout.get()  # smoothed, then cut
         app.stop_robot()
+
+
+def test_stall_zone_is_shaded_exactly_where_the_check_trips(root):
+    config = mc.SafetyConfig()  # n = 0.001, b = 50
+    plot = mc.Plot(root, 254, 180, "accel x vs ΔPWM", "forward ΔPWM", "accel x",
+                   [("fwd", "#000000", "dot")], xlim=(-540, 540), ylim=(-0.5, 0.5))
+    plot.zones = mc.stall_zone(config)
+    plot.redraw({})
+    zone = set(plot.find_withtag("zone"))
+    assert len(zone) == 2  # one wedge per direction
+    x0, y0, x1, y1 = plot.box
+
+    def shaded(change, accel):
+        px = x0 + (change + 540) / 1080 * (x1 - x0)
+        py = y1 - (accel + 0.5) / 1.0 * (y1 - y0)
+        return bool(zone & set(plot.find_overlapping(px, py, px, py)))
+
+    # (forward ΔPWM, accel x): a few pixels away from the line, either side of it.
+    for change, accel in [(300, 0.0), (300, 0.2), (300, 0.3), (-300, -0.2), (-300, 0.3),
+                          (100, 0.02), (100, -0.09), (40, 0.0), (-40, 0.0), (500, 0.4), (500, 0.48)]:
+        need = config.stall_min_accel(change)
+        trips = need is not None and abs(accel) < need
+        assert shaded(change, accel) == trips, (change, accel, need)
+
+
+def test_plot_window_shades_the_stall_zone_with_safety_on(root, safe_app_and_robot):
+    app, _ = safe_app_and_robot
+    plots = app.open_plots()
+    plots.window.withdraw()
+    assert _pump(root, until=lambda: len(plots.change_scatters[0].find_withtag("zone")) == 2)
+    assert "red zone: stall trip, |accel x| < 0.001 (|forward ΔPWM| - 50)" in plots.info.get()

@@ -117,8 +117,8 @@ sensors disagree with what it was told to do:
 
 | trip | fires when |
 |---|---|
-| `stall` | a track is above PWM 100, the forward command (the tracks' mean PWM) changed by more than 50, but `accel` x stayed within ±0.3 m/s² |
-| `no_turn` | a track is above PWM 100, the tracks differ by more than 30, but the gyro's yaw rate stayed within ±2 deg/s |
+| `stall` | the forward command (the tracks' mean PWM) changed by x since the previous step, \|x\| > b, but \|`accel` x\| stayed below \|n·(\|x\| − b)\|: the bigger the change, the more acceleration (or braking) it must bring. b = `stall_offset` (50), n = `stall_slope` (0.001 m/s² per PWM), so a change of 150 needs 0.1 m/s² |
+| `no_turn` | a track is above PWM 100, the tracks differ by more than 30, but the gyro's yaw rate stayed within ±1 deg/s |
 | `obstacle` | the ultrasonic range is under 0.15 m while driving forward. A forward command is also refused while the last reading is that close, but reversing and spinning stay allowed, so the robot can back away |
 
 A trip **latches**. The env stops the robot at once, then every step sends zero PWM until
@@ -128,11 +128,13 @@ A trip **latches**. The env stops the robot at once, then every step sends zero 
 
 The checks judge the PWM the robot actually receives (after the smoothing and deadzone), not
 the action passed to `step()`. Smoothing spreads a speed change over several steps, so the
-`stall` check, which needs a change of more than 50 in one step, sees fewer of them. The
+`stall` check, which only looks at changes of more than b in one step, sees fewer of them. The
 checks run once per step on the PC, so they react a step late (~0.2 s). They add to the
 robot's own hold-timeout stop; they don't replace it. The thresholds are fields of
-`SafetyConfig`. Tune `min_accel` and `min_yaw_rate` for your robot with the manual-control
-plots: *accel x vs ΔPWM* and *yaw rate vs PWM L−R* show what it really does.
+`SafetyConfig`. Tune them for your robot with the manual-control plots. *accel x vs ΔPWM*
+shades the stall trip zone in red: every step plotted inside it would trip, so set n and b
+until your robot's normal starts and stops land outside it. *yaw rate vs PWM L−R* shows
+what `min_yaw_rate` should be.
 
 ## Things to know about this hardware
 
@@ -225,7 +227,10 @@ keep it still for ~2 seconds after switching it on.
   * scatter plots of accel x, y and z against **ΔPWM**, the change in PWM since the previous
     step. A command change takes effect at the start of a step, so it lines up with that
     step's acceleration, which makes this the clearer view of how the tracks respond. It's
-    skipped after gaps over 1 s (pauses, reconnects, resets);
+    skipped after gaps over 1 s (pauses, reconnects, resets). Accel x is plotted against the
+    **forward** ΔPWM (the mean of both tracks' changes), which is what the stall check judges.
+    With the safety layer on, its trip zone is shaded red there, and the formula with your
+    n and b is shown under the plots;
   * a turning column: the gyro's **yaw rate** (heading change ÷ step time, deg/s,
     counter-clockwise positive) against the **left − right PWM difference**, and the change
     in yaw rate against the change in that difference. Right > left turns the robot

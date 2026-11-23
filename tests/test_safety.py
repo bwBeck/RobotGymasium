@@ -38,8 +38,9 @@ def test_stall_trips_when_a_big_pwm_change_brings_no_acceleration():
 @pytest.mark.parametrize("prev, pwm, accel_x", [
     ((0, 0), (150, 150), 0.5),  # it did accelerate
     ((150, 150), (0, 0), -0.5),  # braking counts too
-    ((0, 0), (100, 100), 0.0),  # not above 100
-    ((110, 110), (160, 160), 0.0),  # changed by 50: not above 50
+    ((0, 0), (100, 100), 0.06),  # a small change needs only a little: 0.001 * (100 - 50)
+    ((0, 0), (50, 50), 0.0),  # changed by 50: not above b, not checked
+    ((110, 110), (160, 160), 0.0),  # same at speed
     ((150, 150), (150, 150), 0.0),  # steady cruise, nothing changed
 ])
 def test_stall_stays_quiet(prev, pwm, accel_x):
@@ -55,6 +56,31 @@ def test_stall_judges_the_change_in_forward_speed():
     # forward acceleration on a healthy robot: not a stall. The yaw shows they turned.
     assert _check((153, 153), (153, 102), accel_x=-0.2, yaw_deg_s=-8.0)[0] is None
     assert _check((0, 0), (150, -150), accel_x=0.0, yaw_deg_s=-40.0)[0] is None
+
+
+@pytest.mark.parametrize("prev, pwm, accel_x, trips", [
+    ((0, 0), (150, 150), 0.09, True), ((0, 0), (150, 150), 0.11, False),  # needs 0.1
+    ((0, 0), (250, 250), 0.19, True), ((0, 0), (250, 250), 0.21, False),  # bigger change: 0.2
+    ((250, 250), (0, 0), -0.19, True), ((250, 250), (0, 0), -0.21, False),  # braking: mirrored
+    ((0, 0), (-250, -250), -0.19, True), ((0, 0), (-250, -250), 0.21, False),  # either sign
+])
+def test_stall_needs_more_acceleration_the_bigger_the_change(prev, pwm, accel_x, trips):
+    trip, _ = _check(prev, pwm, accel_x=accel_x)
+    assert (trip is not None and trip.trigger == "stall") == trips, trip
+
+
+def test_stall_line():
+    config = SafetyConfig()  # n = 0.001, b = 50
+    assert config.stall_min_accel(50) is None and config.stall_min_accel(-50) is None
+    assert config.stall_min_accel(150) == pytest.approx(0.1)
+    assert config.stall_min_accel(-250) == pytest.approx(0.2)
+    assert SafetyConfig(stall_slope=-0.002).stall_min_accel(150) == pytest.approx(0.2)  # |n (...)|
+    assert SafetyConfig(stall_offset=100).stall_min_accel(150) == pytest.approx(0.05)
+
+
+def test_stall_is_checked_at_any_speed_once_the_change_is_above_b():
+    # Both tracks under pwm_threshold (which only gates the no-turn check): still checked.
+    assert _check((0, 0), (80, 80), accel_x=0.0)[0].trigger == "stall"  # needs 0.03
 
 
 def test_stall_counts_from_rest_after_the_robots_hold_timeout_stopped_it():
@@ -115,10 +141,11 @@ def test_a_trip_latches_until_cleared():
 
 
 def test_thresholds_come_from_the_config():
-    layer = SafetyLayer(SafetyConfig(min_distance=0.5, min_accel=1.0))
+    layer = SafetyLayer(SafetyConfig(min_distance=0.5, stall_slope=0.01))
     assert layer.command((50, 50), 0.4) == (0, 0)
     layer.clear()
-    assert layer.check((0, 0), (150, 150), *_step(accel_x=0.5)).trigger == "stall"
+    trip = layer.check((0, 0), (150, 150), *_step(accel_x=0.5))  # the default line needs 0.1
+    assert trip.trigger == "stall" and "needs ±1.00" in trip.message
 
 
 # --------------------------------------------------------- in the env

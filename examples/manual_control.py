@@ -458,9 +458,11 @@ class SafetyLatch(tk.Frame):
 
 
 PLOT_COLORS = {"left": "#2f6fd6", "right": "#e8833a", "x": "#d93025", "y": "#1e8e3e", "z": "#8e44ad",
-               "yaw": "#00897b"}
+               "yaw": "#00897b", "fwd": "#3c4650"}
 # Distinct shapes keep coinciding points visible (e.g. left = right PWM when driving straight).
-PLOT_MARKERS = {"left": "dot", "right": "ring", "x": "dot", "y": "square", "z": "ring", "yaw": "dot"}
+PLOT_MARKERS = {"left": "dot", "right": "ring", "x": "dot", "y": "square", "z": "ring", "yaw": "dot",
+                "fwd": "dot"}
+ZONE_FILL, ZONE_EDGE = "#fde3e1", "#d93025"  # the safety layer's trip zone
 _MARKER_LAYER = {"square": 0, "dot": 1, "ring": 2}  # big filled first, rings on top
 
 
@@ -491,9 +493,43 @@ def _blend(color: str, amount: float) -> str:
     return "#%02x%02x%02x" % tuple(round(c + (255 - c) * amount) for c in rgb)
 
 
+def stall_zone(config: SafetyConfig, reach: float = 1e4) -> list[list[tuple[float, float]]]:
+    """The stall check's trip zone in the (forward ΔPWM, accel x) plane, as two polygons:
+    wedges opening from ΔPWM = ±b between accel x = ±n (|ΔPWM| - b). A step plotted inside
+    them trips the safety layer. ``reach`` puts the far edge beyond any axis."""
+    b, edge = config.stall_offset, config.stall_min_accel(reach)
+    return [[(b, 0.0), (reach, edge), (reach, -edge)], [(-b, 0.0), (-reach, edge), (-reach, -edge)]]
+
+
+def _clip_polygon(points, box):
+    """The part of a polygon inside the box (x0, y0, x1, y1), Sutherland-Hodgman style."""
+    x0, y0, x1, y1 = box
+
+    def at_x(x):
+        return lambda p, q: (x, p[1] + (q[1] - p[1]) * (x - p[0]) / (q[0] - p[0]))
+
+    def at_y(y):
+        return lambda p, q: (p[0] + (q[0] - p[0]) * (y - p[1]) / (q[1] - p[1]), y)
+
+    for inside, cross in ((lambda p: p[0] >= x0, at_x(x0)), (lambda p: p[0] <= x1, at_x(x1)),
+                          (lambda p: p[1] >= y0, at_y(y0)), (lambda p: p[1] <= y1, at_y(y1))):
+        clipped = []
+        for i, p in enumerate(points):
+            q = points[i - 1]  # the previous vertex: each edge q -> p
+            if inside(p):
+                if not inside(q):
+                    clipped.append(cross(q, p))
+                clipped.append(p)
+            elif inside(q):
+                clipped.append(cross(q, p))
+        points = clipped
+    return points
+
+
 class Plot(tk.Canvas):
     """A small live plot: auto-scaled axes with round ticks and one marker per point,
-    optionally joined by a faint line. Cheap enough to redraw at the step rate."""
+    optionally joined by a faint line, over optional shaded zones (polygons in data
+    coordinates, ``zones``). Cheap enough to redraw at the step rate."""
 
     LEFT, RIGHT, TOP, BOTTOM = 52, 12, 26, 34
 
@@ -515,6 +551,7 @@ class Plot(tk.Canvas):
             x -= 10
         self.create_text((x0 + x1) / 2, height - 7, text=xlabel, fill="#5f6b7a", font=("TkDefaultFont", 8))
         self.create_text(11, (y0 + y1) / 2, text=ylabel, angle=90, fill="#5f6b7a", font=("TkDefaultFont", 8))
+        self.zones: list[list[tuple[float, float]]] = []
         self.redraw({})
 
     def redraw(self, data: dict, xlim=None) -> None:
@@ -526,6 +563,12 @@ class Plot(tk.Canvas):
         sx = (x1 - x0) / (xlim[1] - xlim[0])
         sy = (y1 - y0) / (ylim[1] - ylim[0])
         small = ("TkDefaultFont", 8)
+        for zone in self.zones:  # under everything else; the axes don't scale to them
+            pixels = [(x0 + (zx - xlim[0]) * sx, y1 - (zy - ylim[0]) * sy) for zx, zy in zone]
+            clipped = _clip_polygon(pixels, self.box)
+            if len(clipped) >= 3:
+                self.create_polygon(*[c for p in clipped for c in p], fill=ZONE_FILL, outline=ZONE_EDGE,
+                                    tags=("dyn", "zone"))
         ticks = nice_ticks(*xlim)
         for v, text in zip(ticks, _tick_labels(ticks)):
             px = x0 + (v - xlim[0]) * sx
@@ -575,12 +618,17 @@ class PlotWindow:
     """Second window: the PWM sent and the accelerometer over a rolling time window; each
     accelerometer axis against the PWM of both tracks and against the change in PWM since
     the previous step; and, for turning, the gyro's yaw rate against the left - right PWM
-    difference and its change against the change in that difference."""
+    difference and its change against the change in that difference.
+
+    Accel x is plotted against the forward ΔPWM (the mean of both tracks' changes), the
+    value the safety layer's stall check judges; with ``safety`` given, its trip zone is
+    shaded there."""
 
     MAX_STEP_GAP_S = 1.0  # a longer gap (pause, reconnect, reset) has no meaningful PWM change
 
-    def __init__(self, root: tk.Tk, seconds: float, on_close, on_clear):
+    def __init__(self, root: tk.Tk, seconds: float, on_close, on_clear, safety: SafetyConfig | None = None):
         self.seconds = seconds
+        self.safety = safety
         self.window = tk.Toplevel(root)
         self.window.title("RoboGym plots - PWM and accelerometer")
         self.window.resizable(False, False)
@@ -597,9 +645,13 @@ class PlotWindow:
                                "time (s)", "m/s²", axes, join=True)
         self.scatters = [Plot(frame, 254, 180, f"accel {a} vs PWM", "PWM", f"accel {a} (m/s²)",
                               tracks, xlim=(-275, 275)) for a in "xyz"]
+        forward = [("fwd", PLOT_COLORS["fwd"], PLOT_MARKERS["fwd"])]
         self.change_scatters = [Plot(frame, 254, 180, f"accel {a} vs ΔPWM",
-                                     "ΔPWM since the previous step", f"accel {a} (m/s²)",
-                                     tracks, xlim=(-540, 540)) for a in "xyz"]
+                                     "forward ΔPWM (mean of both tracks)" if a == "x"
+                                     else "ΔPWM since the previous step", f"accel {a} (m/s²)",
+                                     forward if a == "x" else tracks, xlim=(-540, 540)) for a in "xyz"]
+        if safety is not None:
+            self.change_scatters[0].zones = stall_zone(safety)
         # Counter-clockwise yaw is positive, so it comes with right > left: a falling slope.
         self.turn_scatter = Plot(frame, 254, 180, "yaw rate vs PWM L-R", "PWM left - right",
                                  "yaw rate (deg/s)", yaw, xlim=(-540, 540), min_span=10.0)
@@ -637,12 +689,20 @@ class PlotWindow:
         self.accel_plot.redraw({"x": (t, ax), "y": (t, ay), "z": (t, az)}, xlim=window)
         ok = ~np.isnan(change[:, 0])
         d_left, d_right, d_yaw = change[ok].T
-        for accel, plot, change_plot in zip((ax, ay, az), self.scatters, self.change_scatters):
+        for accel, plot in zip((ax, ay, az), self.scatters):
             plot.redraw({"left": (pwm_l, accel), "right": (pwm_r, accel)})
+        # Accel x against the forward change, as the stall check sees it.
+        self.change_scatters[0].redraw({"fwd": ((d_left + d_right) / 2, ax[ok])})
+        for accel, change_plot in zip((ay, az), self.change_scatters[1:]):
             change_plot.redraw({"left": (d_left, accel[ok]), "right": (d_right, accel[ok])})
         self.turn_scatter.redraw({"yaw": (pwm_l - pwm_r, yaw)})
         self.turn_change_scatter.redraw({"yaw": (d_left - d_right, d_yaw)})
-        self.info.set(f"{len(rows)} steps in the last {self.seconds:.0f} s - one dot per env step")
+        text = f"{len(rows)} steps in the last {self.seconds:.0f} s - one dot per env step"
+        if self.safety is not None:
+            c = self.safety
+            text += (f"    red zone: stall trip, |accel x| < {c.stall_slope:g} (|forward ΔPWM| - "
+                     f"{c.stall_offset:g}) once |forward ΔPWM| > {c.stall_offset:g}")
+        self.info.set(text)
 
     def _place_beside(self, root: tk.Tk) -> None:
         """Next to the main window if the screen has room; otherwise the window manager decides."""
@@ -685,7 +745,9 @@ class ManualControlApp:
     def open_plots(self) -> PlotWindow:
         """Opens the plot window, or brings it to the front if it is already open."""
         if self.plots is None:
-            self.plots = PlotWindow(self.root, self.plot_seconds, self._close_plots, self.clear_history)
+            safety = self.env.safety.config if self.env.safety is not None else None
+            self.plots = PlotWindow(self.root, self.plot_seconds, self._close_plots, self.clear_history,
+                                    safety=safety)
             self._plots_dirty = True
         else:
             self.plots.window.deiconify()

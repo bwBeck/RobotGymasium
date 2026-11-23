@@ -1,16 +1,18 @@
 """Safety layer: stops the robot when its sensors disagree with what it was told to do.
 
-``RoboGym(safety=SafetyConfig())`` checks every step for three things. "Fast" means
-either track's |PWM| is above ``pwm_threshold`` (100):
+``RoboGym(safety=SafetyConfig())`` checks every step for three things:
 
-1. **stall**: fast, and the forward command (the mean of the two tracks' PWM) changed
-   by more than ``pwm_step`` (50) since the previous step, yet the forward acceleration
-   (``accel`` x) stayed within ±``min_accel``. The speed should have changed and didn't:
-   blocked tracks, robot wedged against something. It's the mean because forward speed
-   is: one track changing alone moves it half as much, and starting a spin (tracks
-   changing in opposite directions) doesn't move it at all, which check 2 covers.
-2. **no turn**: fast, and the tracks differ by more than ``turn_pwm_diff`` (30), yet the
-   gyro's yaw rate stayed within ±``min_yaw_rate``. The robot should be turning and isn't.
+1. **stall**: ``x`` is how much the forward command (the mean of the two tracks' PWM)
+   changed since the previous step. When ``|x| > stall_offset`` (b, 50), the forward
+   acceleration (``accel`` x) must reach ``|stall_slope * (|x| - b)|`` (n, 0.001 m/s² per
+   PWM): a bigger change must bring a bigger acceleration, or braking. If it doesn't, the
+   speed didn't follow the command: blocked tracks, robot wedged against something. It's
+   the mean because forward speed is: one track changing alone moves it half as much, and
+   starting a spin (tracks changing in opposite directions) doesn't move it at all, which
+   check 2 covers. The manual-control plot *accel x vs ΔPWM* draws this line.
+2. **no turn**: either track's |PWM| is above ``pwm_threshold`` (100) and the tracks
+   differ by more than ``turn_pwm_diff`` (30), yet the gyro's yaw rate stayed within
+   ±``min_yaw_rate``. The robot should be turning and isn't.
 3. **obstacle**: the ultrasonic range is below ``min_distance`` (0.15 m) while driving
    forward (left + right PWM > 0). A forward command is also refused outright while the
    last range reading is that close. Reversing and spinning in place stay allowed, so
@@ -36,16 +38,25 @@ logger = logging.getLogger("robotgym")
 
 @dataclass
 class SafetyConfig:
-    """Thresholds of the safety layer. Tune the sensor ones (``min_accel``,
-    ``min_yaw_rate``) with the plots in ``examples/manual_control.py``: accel x vs ΔPWM
-    and yaw rate vs PWM L-R show what the robot really does."""
+    """Thresholds of the safety layer. Tune the sensor ones (``stall_slope`` and
+    ``stall_offset``, ``min_yaw_rate``) with the plots in ``examples/manual_control.py``:
+    accel x vs ΔPWM (which draws the stall line) and yaw rate vs PWM L-R show what the
+    robot really does."""
 
-    pwm_threshold: int = 100  # stall / no-turn checks apply while either |PWM| is above this
-    pwm_step: int = 50  # stall: the tracks' mean PWM changed by more than this since the previous step...
-    min_accel: float = 0.1  # ...but |accel x| stayed below this [m/s^2]
+    stall_offset: float = 50.0  # b: stall is checked once the forward PWM changes by more than this...
+    stall_slope: float = 0.001  # n: ...and needs |accel x| >= |n (|change| - b)| [m/s^2 per PWM]
+    pwm_threshold: int = 100  # no-turn check applies while either |PWM| is above this
     turn_pwm_diff: int = 30  # no turn: |left - right PWM| above this...
     min_yaw_rate: float = 1.0  # ...but |yaw rate| stayed below this [deg/s]
     min_distance: float = 0.15  # obstacle: closest ultrasonic range allowed while driving forward [m]
+
+
+    def stall_min_accel(self, change: float) -> float | None:
+        """The |accel x| [m/s^2] a forward PWM change of ``change`` must bring, or None
+        where the stall check doesn't apply (``|change| <= stall_offset``)."""
+        if abs(change) <= self.stall_offset:
+            return None
+        return abs(self.stall_slope * (abs(change) - self.stall_offset))
 
 
 @dataclass(frozen=True)
@@ -109,17 +120,17 @@ class SafetyLayer:
         if (not info.get("imu_ok", False) or info.get("accel_raw") is None
                 or info.get("robot_rebooted", False) or robot_dt <= 0.0):
             return None
-        if max(abs(left), abs(right)) <= c.pwm_threshold:
-            return None
-
         if info.get("watchdog_stopped", False):
             prev_pwm = (0, 0)  # the robot's hold timeout stopped it: it starts from rest
-        jump = abs((left - prev_pwm[0]) + (right - prev_pwm[1])) / 2  # change of the forward command
+        change = ((left - prev_pwm[0]) + (right - prev_pwm[1])) / 2  # of the forward command
+        need = c.stall_min_accel(change)
         accel_x = float(obs["accel"][0])
-        if jump > c.pwm_step and abs(accel_x) < c.min_accel:
-            return self._latch("stall", f"STALL: forward PWM changed by {jump:g} but accel x was "
-                                        f"{accel_x:+.3f} m/s² (needs ±{c.min_accel:.2f})")
+        if need is not None and abs(accel_x) < need:
+            return self._latch("stall", f"STALL: forward PWM changed by {change:+g} but accel x was "
+                                        f"{accel_x:+.3f} m/s² (needs ±{need:.2f})")
 
+        if max(abs(left), abs(right)) <= c.pwm_threshold:
+            return None
         diff = left - right
         yaw_rate = math.degrees(float(obs["delta_pose"][2]) / robot_dt)
         if abs(diff) > c.turn_pwm_diff and abs(yaw_rate) < c.min_yaw_rate:
